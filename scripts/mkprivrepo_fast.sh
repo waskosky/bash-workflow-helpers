@@ -113,14 +113,21 @@ open_in_github_desktop() {
 # ---- auth helpers ----
 require_auth() {
   say "Checking GitHub auth"
-  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>auth.err; then
+  local auth_err
+  auth_err="$(mktemp)"
+  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>"$auth_err"; then
     # add read:org for org repo checks
-    timeout "$HTTP_TIMEOUT" gh auth refresh -h github.com -s repo -s read:org -s admin:public_key >/dev/null 2>>auth.err || true
+    timeout "$HTTP_TIMEOUT" gh auth refresh -h github.com -s repo -s read:org -s admin:public_key >/dev/null 2>>"$auth_err" || true
   fi
-  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>auth.err; then
+  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
     say "Login required"
-    timeout 120s gh auth login --hostname github.com --git-protocol ssh --web || die 10 "Login timed out or failed"
+    timeout 120s gh auth login --hostname github.com --git-protocol ssh --web || { rm -f "$auth_err"; die 10 "Login timed out or failed"; }
+    if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
+      rm -f "$auth_err"
+      die 10 "GitHub auth check failed after login"
+    fi
   fi
+  rm -f "$auth_err"
 }
 
 
@@ -147,18 +154,17 @@ fi
 git config user.name >/dev/null 2>&1 || git config user.name "$GH_NAME"
 git config user.email >/dev/null 2>&1 || git config user.email "$USE_EMAIL"
 
-if [[ -z "$(git rev-list --max-count=1 HEAD 2>/dev/null || true)" ]]; then
-  say "Creating initial commit"
-  printf '# %s\n\nCreated on %s\n' "$TITLE" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > README.md
-  git add README.md
-  GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit -m "Initial commit" >/dev/null
-fi
-
-HEAD_EMAIL="$(git log -1 --pretty=format:%ae)"
-if [[ "$HEAD_EMAIL" != "$ADDR_ID" && "$HEAD_EMAIL" != "$ADDR_USER" ]]; then
-  say "Amending HEAD to use noreply email"
-  git config user.email "$USE_EMAIL"
-  GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
+HAS_COMMITS=0
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  HAS_COMMITS=1
+  HEAD_EMAIL="$(git log -1 --pretty=format:%ae)"
+  if [[ "$HEAD_EMAIL" != "$ADDR_ID" && "$HEAD_EMAIL" != "$ADDR_USER" ]]; then
+    say "Amending HEAD to use noreply email"
+    git config user.email "$USE_EMAIL"
+    GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
+  fi
+else
+  say "No commits present; leaving working tree empty."
 fi
 
 REMOTE_SSH="git@github.com:${OWNER}/${REPO}.git"
@@ -184,13 +190,13 @@ sanitize_desc() {  # remove ASCII control chars (incl. CR, LF, TAB)
   printf '%s' "$in" | LC_ALL=C tr -d '\000-\037\177'
 }
 
-post_github_json() { # $1=endpoint (starts with /), $2=json payload -> body->repo.create.body, echoes HTTP code
-  local endpoint="$1" payload="$2" token url code curl_max
+post_github_json() { # $1=endpoint (starts with /), $2=json payload, $3=output file for the response body; echoes HTTP code
+  local endpoint="$1" payload="$2" output="$3" token url code curl_max
   token="$(gh auth token)" || { echo 0; return 1; }
   url="https://api.github.com$endpoint"
   curl_max="${HTTP_TIMEOUT%s}"
   code="$(
-    curl -sS -o repo.create.body \
+    curl -sS -o "$output" \
       -w '%{http_code}' \
       -H "Authorization: Bearer $token" \
       -H "Accept: application/vnd.github+json" \
@@ -202,20 +208,22 @@ post_github_json() { # $1=endpoint (starts with /), $2=json payload -> body->rep
 }
 
 create_repo_or_explain() {
-  rm -f repo.err repo.create.body
+  local repo_err repo_body payload code endpoint desc
+  repo_err="$(mktemp)"
+  repo_body="$(mktemp)"
 
   # Fast path: visible and exists
-  if timeout "$HTTP_TIMEOUT" gh api -X GET "/repos/${OWNER}/${REPO}" >/dev/null 2>repo.err; then
+  if timeout "$HTTP_TIMEOUT" gh api -X GET "/repos/${OWNER}/${REPO}" >/dev/null 2>"$repo_err"; then
+    rm -f "$repo_err" "$repo_body"
     say "Remote exists"
     return 0
   fi
-  if grep -q '401' repo.err; then
+  if grep -q '401' "$repo_err"; then
     say "401 on repo GET; refreshing auth"
     require_auth
   fi
 
   say "Creating repo ${OWNER}/${REPO}"
-  local payload code endpoint desc
   desc="$(sanitize_desc "${DESC:-$TITLE}")"
 
   if [[ "$OWNER" == "$GH_LOGIN" ]]; then
@@ -231,20 +239,23 @@ create_repo_or_explain() {
     endpoint="/orgs/$OWNER/repos"
   fi
 
-  code="$(post_github_json "$endpoint" "$payload")"
+  code="$(post_github_json "$endpoint" "$payload" "$repo_body")"
   if [[ "$code" == "201" ]]; then
+    rm -f "$repo_err" "$repo_body"
     return 0
   fi
 
-  if grep -qi 'already exists' repo.create.body; then
+  if grep -qi 'already exists' "$repo_body"; then
+    rm -f "$repo_err" "$repo_body"
     say "Repo already exists. Continuing."
     return 0
   fi
 
-  say "Create failed details (HTTP $code): $(tr '\n' ' ' < repo.create.body)"
+  say "Create failed details (HTTP $code): $(tr '\n' ' ' < "$repo_body")"
   if [[ "$code" == "422" ]]; then
     say "Hint: control chars were removed; if policy blocks visibility, set VISIBILITY=public or internal and rerun."
   fi
+  rm -f "$repo_err" "$repo_body"
   die 11 "Failed to create repo ${OWNER}/${REPO}"
 }
 
@@ -252,35 +263,40 @@ create_repo_or_explain
 
 
 # ---- push with proper exit-code handling ----
-say "Pushing to origin"
-push_once() { rm -f push.err; timeout "$PUSH_TIMEOUT" git push -u origin HEAD 2>push.err; }
+if (( HAS_COMMITS )); then
+  say "Pushing to origin"
+  push_once() { rm -f push.err; timeout "$PUSH_TIMEOUT" git push -u origin HEAD 2>push.err; }
 
-ok=0
-if push_once; then
-  ok=1
-else
-  if grep -q 'HTTP 401' push.err; then
-    say "401 on push; refreshing auth"
-    require_auth
-    push_once && ok=1 || ok=0
-  fi
-fi
-
-if (( ! ok )); then
-  if grep -q 'GH007' push.err; then
-    say "GH007 detected; switching to alternate noreply format"
-    USE_EMAIL="$ADDR_USER"
-    git config user.email "$USE_EMAIL"
-    GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
-    rm -f push.err
-    if timeout "$PUSH_TIMEOUT" git push --force-with-lease -u origin HEAD 2>push.err; then
-      ok=1
-    else
-      die 12 "Push failed after GH007 fix: $(tr '\n' ' ' < push.err)"
-    fi
+  ok=0
+  if push_once; then
+    ok=1
   else
-    die 13 "Push failed: $(tr '\n' ' ' < push.err)"
+    if grep -q 'HTTP 401' push.err; then
+      say "401 on push; refreshing auth"
+      require_auth
+      push_once && ok=1 || ok=0
+    fi
   fi
+
+  if (( ! ok )); then
+    if grep -q 'GH007' push.err; then
+      say "GH007 detected; switching to alternate noreply format"
+      USE_EMAIL="$ADDR_USER"
+      git config user.email "$USE_EMAIL"
+      GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
+      rm -f push.err
+      if timeout "$PUSH_TIMEOUT" git push --force-with-lease -u origin HEAD 2>push.err; then
+        ok=1
+      else
+        die 12 "Push failed after GH007 fix: $(tr '\n' ' ' < push.err)"
+      fi
+    else
+      die 13 "Push failed: $(tr '\n' ' ' < push.err)"
+    fi
+  fi
+  rm -f push.err
+else
+  say "Skipping push; repo has no commits so remote stays empty."
 fi
 
 # ---- register in GitHub Desktop ----
