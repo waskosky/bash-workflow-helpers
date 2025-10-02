@@ -22,10 +22,33 @@ ensure_block_in_file() {
   local block="$2"
   mkdir -p "$(dirname "$file")"
   touch "$file"
+
+  # If block is present, refresh it in-place; otherwise append a new one
   if grep -Fq "$MARK_BEGIN" "$file"; then
-    echo "- Skipping: block already present in $file"
+    backup_file "$file"
+    local tmp_block tmp_out
+    tmp_block="$(mktemp)"; tmp_out="$(mktemp)"
+    printf "%s\n" "$block" >"$tmp_block"
+    awk -v begin="$MARK_BEGIN" -v end="$MARK_END" -v blockfile="$tmp_block" '
+      BEGIN{inblock=0}
+      $0==begin {
+        print begin;
+        while ((getline line < blockfile) > 0) print line;
+        close(blockfile);
+        print end;
+        inblock=1;
+        next;
+      }
+      inblock && $0==end { inblock=0; next }
+      inblock { next }
+      { print }
+    ' "$file" >"$tmp_out"
+    mv -f "${tmp_out}" "$file"
+    rm -f "$tmp_block"
+    echo "+ Refreshed shared-history block in $file"
     return 0
   fi
+
   backup_file "$file"
   {
     echo ""
@@ -53,13 +76,25 @@ if [ -n "$BASH_VERSION" ]; then
   shopt -s histappend
   shopt -s cmdhist
 
-  # After each command: append this line, then reload from the file
-  # so we immediately see other sessions' commands.
-  __shared_history_sync_history() { history -a; history -c; history -r; }
-  case ";${PROMPT_COMMAND:-};" in
-    *"__shared_history_sync_history"*) ;;
-    *) PROMPT_COMMAND="__shared_history_sync_history${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}" ;;
-  esac
+  # After each command: append new history, then read only new lines.
+  # This avoids clearing in-memory history (which can make Up-arrow empty)
+  # and is resilient if the history file is missing/unreadable.
+  __shared_history_sync_history() {
+    builtin history -a 2>/dev/null || :   # append this session's new lines
+    builtin history -n 2>/dev/null || :   # read lines not yet read from HISTFILE
+  }
+  # Safely attach to PROMPT_COMMAND, supporting both string and array forms
+  if declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare \-a'; then
+    case " ${PROMPT_COMMAND[*]} " in
+      *" __shared_history_sync_history "*) ;;
+      *) PROMPT_COMMAND=(__shared_history_sync_history "${PROMPT_COMMAND[@]}");;
+    esac
+  else
+    case ";${PROMPT_COMMAND:-};" in
+      *"__shared_history_sync_history"*) ;;
+      *) PROMPT_COMMAND="__shared_history_sync_history${PROMPT_COMMAND:+; ${PROMPT_COMMAND}}" ;;
+    esac
+  fi
 fi
 EOF
 }
@@ -126,16 +161,14 @@ install_systemwide() {
       echo "$MARK_END"
     } > "$tmp"
     sudo mkdir -p "$profiled"
-    if [[ -f "$dropin" ]] && sudo grep -Fq "$MARK_BEGIN" "$dropin"; then
-      echo "- Skipping: block already present in $dropin"
+    if [[ -f "$dropin" ]]; then
+      sudo cp -p "$dropin" "${dropin}.bak.$(timestamp)"
+      echo "+ Refreshed $dropin"
     else
-      if [[ -f "$dropin" ]]; then
-        sudo cp -p "$dropin" "${dropin}.bak.$(timestamp)"
-      fi
-      sudo tee "$dropin" >/dev/null < "$tmp"
-      sudo chmod 0644 "$dropin"
       echo "+ Installed $dropin"
     fi
+    sudo tee "$dropin" >/dev/null < "$tmp"
+    sudo chmod 0644 "$dropin"
     rm -f "$tmp"
   else
     # Fallback to global bashrc if profile.d doesn't exist
@@ -145,21 +178,39 @@ install_systemwide() {
       if [[ -f "$f" ]]; then target="$f"; break; fi
     done
     if [[ -n "$target" ]]; then
-      local tmp
-      tmp="$(mktemp)"
+      local tmp tmp_awk
+      tmp="$(mktemp)"; tmp_awk="$(mktemp)"
       bash_block > "$tmp"
+      cat >"$tmp_awk" <<'AWK'
+BEGIN{inblock=0}
+$0==begin {
+  print begin;
+  while ((getline line < blockfile) > 0) print line;
+  close(blockfile);
+  print end;
+  inblock=1;
+  next;
+}
+inblock && $0==end { inblock=0; next }
+inblock { next }
+{ print }
+AWK
       sudo bash -c '
         set -e
-        file="$1"; mark_begin="$2" mark_end="$3"
+        file="$1"; mark_begin="$2"; mark_end="$3"; blockfile="$4"; awkscript="$5"
         if grep -Fq "$mark_begin" "$file"; then
-          echo "- Skipping: block already present in $file"
+          cp -p "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
+          tmp_out="$(mktemp)"
+          awk -v begin="$mark_begin" -v end="$mark_end" -v blockfile="$blockfile" -f "$awkscript" "$file" >"$tmp_out"
+          mv -f "$tmp_out" "$file"
+          echo "+ Refreshed shared-history block into $file"
         else
           cp -p "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
-          { echo; echo "$mark_begin"; cat "$4"; echo "$mark_end"; } >> "$file"
+          { echo; echo "$mark_begin"; cat "$blockfile"; echo "$mark_end"; } >> "$file"
           echo "+ Installed shared-history block into $file"
         fi
-      ' bash "$target" "$MARK_BEGIN" "$MARK_END" "$tmp"
-      rm -f "$tmp"
+      ' bash "$target" "$MARK_BEGIN" "$MARK_END" "$tmp" "$tmp_awk"
+      rm -f "$tmp" "$tmp_awk"
     else
       echo "! Could not find a global Bash rc file and /etc/profile.d is missing."
       echo "  You may create /etc/profile.d/shared-history.sh manually with the snippet."
@@ -174,20 +225,40 @@ install_systemwide() {
     tmp="$(mktemp)"
     bash_block > "$tmp"
     # Append in root's .bashrc if missing
+    local tmp_awk
+    tmp_awk="$(mktemp)"
+    cat >"$tmp_awk" <<'AWK'
+BEGIN{inblock=0}
+$0==begin {
+  print begin;
+  while ((getline line < blockfile) > 0) print line;
+  close(blockfile);
+  print end;
+  inblock=1;
+  next;
+}
+inblock && $0==end { inblock=0; next }
+inblock { next }
+{ print }
+AWK
     sudo bash -c '
       set -e
-      file="$1"; mark_begin="$2" mark_end="$3"; tmpfile="$4"
+      file="$1"; mark_begin="$2"; mark_end="$3"; blockfile="$4"; awkscript="$5"
       mkdir -p "$(dirname "$file")"
       touch "$file"
       if grep -Fq "$mark_begin" "$file"; then
-        echo "- Skipping: block already present in $file"
+        cp -p "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)" || true
+        tmp_out="$(mktemp)"
+        awk -v begin="$mark_begin" -v end="$mark_end" -v blockfile="$blockfile" -f "$awkscript" "$file" >"$tmp_out"
+        mv -f "$tmp_out" "$file"
+        echo "+ Refreshed shared-history block into $file"
       else
         cp -p "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)" || true
-        { echo; echo "$mark_begin"; cat "$tmpfile"; echo "$mark_end"; } >> "$file"
+        { echo; echo "$mark_begin"; cat "$blockfile"; echo "$mark_end"; } >> "$file"
         echo "+ Installed shared-history block into $file"
       fi
-    ' bash "$root_bashrc" "$MARK_BEGIN" "$MARK_END" "$tmp"
-    rm -f "$tmp"
+    ' bash "$root_bashrc" "$MARK_BEGIN" "$MARK_END" "$tmp" "$tmp_awk"
+    rm -f "$tmp" "$tmp_awk"
   fi
 }
 
@@ -200,6 +271,8 @@ Usage: $0 [--system]
 
 Without flags, configures the current user. With --system, also configures
 system-wide settings (requires sudo; applies to all users including root).
+
+Re-running this script refreshes existing managed blocks in place.
 USAGE
     exit 0
   fi
@@ -227,4 +300,3 @@ USAGE
 }
 
 main "$@"
-
