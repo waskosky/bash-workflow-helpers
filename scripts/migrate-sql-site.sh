@@ -3,9 +3,9 @@ set -euo pipefail
 
 # ---------- EDIT THESE ----------
 # Hosts, users, ports, and paths
-OLD_HOST="locuswebmarketing.com"
-OLD_USER="traveltrim"
-OLD_SSH_PORT=522
+OLD_HOST="old.example.com"
+OLD_USER="ubuntu"
+OLD_SSH_PORT=22
 
 NEW_HOST="new.example.com"
 NEW_USER="ubuntu"
