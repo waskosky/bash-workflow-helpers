@@ -148,7 +148,12 @@ mkdir -p "$DEST"
 cd "$DEST"
 
 # ---- local repo ----
-if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Important: do not rely on `--is-inside-work-tree` here, because if we're
+# inside a parent repo (e.g. $HOME as dotfiles repo), that would be true and we
+# would accidentally mutate the parent repo instead of creating a new one.
+# We only skip init if THIS directory is already a repo (git-dir resolves to .git).
+# If this directory is not already a repo (no .git dir/file), initialize it
+if [[ ! -e .git ]]; then
   say "Initializing local repo at $DEST"
   git init -q
   git symbolic-ref HEAD refs/heads/main >/dev/null 2>&1 || true

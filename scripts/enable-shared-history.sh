@@ -62,7 +62,7 @@ ensure_block_in_file() {
 bash_block() {
   cat <<'EOF'
 # Shared Bash history across sessions
-if [ -n "$BASH_VERSION" ]; then
+if [ -n "$BASH_VERSION" ] && [[ $- == *i* ]]; then
   # Keep a big history and include timestamps
   export HISTFILE="${HISTFILE:-$HOME/.bash_history}"
   export HISTSIZE="${HISTSIZE:-500000}"
@@ -76,13 +76,112 @@ if [ -n "$BASH_VERSION" ]; then
   shopt -s histappend
   shopt -s cmdhist
 
-  # After each command: append new history, then read only new lines.
-  # This avoids clearing in-memory history (which can make Up-arrow empty)
-  # and is resilient if the history file is missing/unreadable.
-  __shared_history_sync_history() {
-    builtin history -a 2>/dev/null || :   # append this session's new lines
-    builtin history -n 2>/dev/null || :   # read lines not yet read from HISTFILE
+  __shared_history_histfile_ready() {
+    local histfile="$1"
+    [[ -n "$histfile" ]] || return 1
+
+    if [[ "$histfile" == */* ]]; then
+      local histdir="${histfile%/*}"
+      [[ -n "$histdir" ]] || histdir="/"
+      if [[ ! -d "$histdir" ]]; then
+        mkdir -p "$histdir" 2>/dev/null || return 1
+      fi
+    fi
+
+    if [[ ! -e "$histfile" ]]; then
+      touch "$histfile" 2>/dev/null || return 1
+      chmod 0600 "$histfile" 2>/dev/null || :
+    fi
+
+    [[ -w "$histfile" ]] || return 1
+    return 0
   }
+
+  __shared_history_histfile_signature() {
+    local file="$1"
+    if [[ ! -e "$file" ]]; then
+      echo "0:0:0:0"
+      return
+    fi
+
+    if [[ -z "${__SHARED_HISTORY_STAT_FMT:-}" ]]; then
+      if stat -Lc '%d:%i:%s:%Y' "$file" >/dev/null 2>&1; then
+        __SHARED_HISTORY_STAT_FMT=gnu
+      elif stat -f '%d:%i:%z:%m' "$file" >/dev/null 2>&1; then
+        __SHARED_HISTORY_STAT_FMT=bsd
+      else
+        __SHARED_HISTORY_STAT_FMT=wc
+      fi
+    fi
+
+    case "${__SHARED_HISTORY_STAT_FMT}" in
+      gnu)
+        stat -Lc '%d:%i:%s:%Y' "$file" 2>/dev/null || echo "0:0:0:0"
+        ;;
+      bsd)
+        stat -f '%d:%i:%z:%m' "$file" 2>/dev/null || echo "0:0:0:0"
+        ;;
+      *)
+        local size
+        size=$(wc -c <"$file" 2>/dev/null || echo 0)
+        printf '0:0:%s:0\n' "$size"
+        ;;
+    esac
+  }
+
+  __shared_history_sync_history() {
+    local default_histfile="$HOME/.bash_history"
+    local histfile="${HISTFILE:-$default_histfile}"
+
+    if ! __shared_history_histfile_ready "$histfile"; then
+      if [[ "$histfile" != "$default_histfile" ]] && __shared_history_histfile_ready "$default_histfile"; then
+        histfile="$default_histfile"
+        HISTFILE="$default_histfile"
+        export HISTFILE
+      else
+        if [[ "${__SHARED_HISTORY_WARNED:-0}" -eq 0 ]]; then
+          __SHARED_HISTORY_WARNED=1
+          printf 'shared-history: unable to access %s (history sharing disabled)\n' "$histfile" >&2
+        fi
+        return
+      fi
+    fi
+
+    if [[ "${__SHARED_HISTORY_FILE:-}" != "$histfile" ]]; then
+      __SHARED_HISTORY_FILE="$histfile"
+      __SHARED_HISTORY_DEV=""
+      __SHARED_HISTORY_INO=""
+      __SHARED_HISTORY_SIZE=""
+      __SHARED_HISTORY_WARNED=0
+    fi
+
+    builtin history -a "$histfile" 2>/dev/null || :
+
+    local sig dev ino size mtime reload
+    sig="$(__shared_history_histfile_signature "$histfile")"
+    IFS=: read -r dev ino size mtime <<<"$sig"
+
+    reload=0
+    if [[ -z "${__SHARED_HISTORY_DEV:-}" ]] || [[ -z "${__SHARED_HISTORY_INO:-}" ]]; then
+      reload=1
+    elif [[ "$dev:$ino" != "${__SHARED_HISTORY_DEV}:${__SHARED_HISTORY_INO}" ]]; then
+      reload=1
+    elif [[ -n "${__SHARED_HISTORY_SIZE:-}" && "$size" -lt "${__SHARED_HISTORY_SIZE}" ]]; then
+      reload=1
+    fi
+
+    if (( reload )); then
+      builtin history -c 2>/dev/null || :
+      builtin history -r "$histfile" 2>/dev/null || :
+    else
+      builtin history -n "$histfile" 2>/dev/null || :
+    fi
+
+    __SHARED_HISTORY_DEV="$dev"
+    __SHARED_HISTORY_INO="$ino"
+    __SHARED_HISTORY_SIZE="$size"
+  }
+
   # Safely attach to PROMPT_COMMAND, supporting both string and array forms
   if declare -p PROMPT_COMMAND 2>/dev/null | grep -q 'declare \-a'; then
     case " ${PROMPT_COMMAND[*]} " in
