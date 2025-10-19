@@ -14,6 +14,27 @@ ts(){ date +'%H:%M:%S'; }
 say(){ printf '[%s] %s\n' "$(ts)" "$*"; }
 die(){ code=$1; shift; say "ERROR: $*"; exit "$code"; }
 
+# ---- timeout helper ----
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="$(command -v timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="$(command -v gtimeout)"
+fi
+TIMEOUT_WARNED=0
+run_timeout() {
+  local duration="$1"; shift
+  if [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" "$duration" "$@"
+  else
+    if [[ "$TIMEOUT_WARNED" -eq 0 ]]; then
+      say "WARN: Missing GNU timeout (coreutils); running without time limits. Install via 'brew install coreutils' to restore timeouts."
+      TIMEOUT_WARNED=1
+    fi
+    "$@"
+  fi
+}
+
 # ---- args ----
 [[ $# -ge 2 ]] || die 1 'Usage: mkprivrepo_fast.sh "Title of repo" owner/repo|git@github.com:owner/repo.git|https://github.com/owner/repo(.git)'
 TITLE="$1"; SPEC="$2"
@@ -115,14 +136,14 @@ require_auth() {
   say "Checking GitHub auth"
   local auth_err
   auth_err="$(mktemp)"
-  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>"$auth_err"; then
+  if ! run_timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>"$auth_err"; then
     # add read:org for org repo checks
-    timeout "$HTTP_TIMEOUT" gh auth refresh -h github.com -s repo -s read:org -s admin:public_key >/dev/null 2>>"$auth_err" || true
+    run_timeout "$HTTP_TIMEOUT" gh auth refresh -h github.com -s repo -s read:org -s admin:public_key >/dev/null 2>>"$auth_err" || true
   fi
-  if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
+  if ! run_timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
     say "Login required"
-    timeout 120s gh auth login --hostname github.com --git-protocol ssh --web || { rm -f "$auth_err"; die 10 "Login timed out or failed"; }
-    if ! timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
+    run_timeout 120s gh auth login --hostname github.com --git-protocol ssh --web || { rm -f "$auth_err"; die 10 "Login timed out or failed"; }
+    if ! run_timeout "$HTTP_TIMEOUT" gh api user >/dev/null 2>>"$auth_err"; then
       rm -f "$auth_err"
       die 10 "GitHub auth check failed after login"
     fi
@@ -220,7 +241,7 @@ create_repo_or_explain() {
   repo_body="$(mktemp)"
 
   # Fast path: visible and exists
-  if timeout "$HTTP_TIMEOUT" gh api -X GET "/repos/${OWNER}/${REPO}" >/dev/null 2>"$repo_err"; then
+  if run_timeout "$HTTP_TIMEOUT" gh api -X GET "/repos/${OWNER}/${REPO}" >/dev/null 2>"$repo_err"; then
     rm -f "$repo_err" "$repo_body"
     say "Remote exists"
     return 0
@@ -272,7 +293,7 @@ create_repo_or_explain
 # ---- push with proper exit-code handling ----
 if (( HAS_COMMITS )); then
   say "Pushing to origin"
-  push_once() { rm -f push.err; timeout "$PUSH_TIMEOUT" git push -u origin HEAD 2>push.err; }
+  push_once() { rm -f push.err; run_timeout "$PUSH_TIMEOUT" git push -u origin HEAD 2>push.err; }
 
   ok=0
   if push_once; then
@@ -292,7 +313,7 @@ if (( HAS_COMMITS )); then
       git config user.email "$USE_EMAIL"
       GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
       rm -f push.err
-      if timeout "$PUSH_TIMEOUT" git push --force-with-lease -u origin HEAD 2>push.err; then
+      if run_timeout "$PUSH_TIMEOUT" git push --force-with-lease -u origin HEAD 2>push.err; then
         ok=1
       else
         die 12 "Push failed after GH007 fix: $(tr '\n' ' ' < push.err)"
