@@ -1,0 +1,15 @@
+# Global defaults loaded at startup
+
+model = "gpt-5"
+
+model_provider = "openai"
+
+# Automatic operation equivalent to --full-auto:
+
+# approves commands on success, escalates on failure, and uses a writeable sandbox.
+
+approval_policy = "never"      # {untrusted|on-request|on-failure|never}
+
+sandbox_mode   = "danger-full-access"  # {read-only|workspace-write|danger-full-access}
+
+model_reasoning_effort = "high"   # {low|medium|high|none}
