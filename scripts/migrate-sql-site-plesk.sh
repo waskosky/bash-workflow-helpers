@@ -52,7 +52,7 @@ NEW_USER="ubuntu"
 NEW_SSH_PORT=22
 
 OLD_WEB_ROOT="/var/www/site"
-NEW_WEB_ROOT="/var/www/site"
+NEW_WEB_ROOT="" # leave empty to auto-detect from Plesk subscription docroot
 
 # Plesk subscription + database defaults (used only when --plesk-setup is supplied)
 PLESK_DOMAIN="example.com"
@@ -64,6 +64,7 @@ PLESK_SYSTEM_PASS="changeme"
 PLESK_DOCROOT_REL="httpdocs" # relative to /var/www/vhosts/<domain>/
 PLESK_DB_SERVER="localhost"
 PLESK_DB_TYPE="mysql"
+PLESK_VHOSTS_ROOT="/var/www/vhosts" # fallback base path if docroot detection needs it
 
 # Uploaded assets directory relative to the web root
 ASSETS_DIR="public/uploads"
@@ -136,6 +137,82 @@ INFO() { echo "[$(TS)] $*"; log_structured "INFO" "$*"; }
 WARN() { echo "[$(TS)] WARN: $*" >&2; log_structured "WARN" "$*"; }
 ERR()  { echo "[$(TS)] ERROR: $*" >&2; log_structured "ERROR" "$*"; }
 
+# ---------- interactive configuration ----------
+require_tty_for_prompt() {
+  if [ ! -t 0 ]; then
+    ERR "Interactive input required to set ${1}. Edit the script or export ${1} before running non-interactively."
+    exit 1
+  fi
+}
+
+prompt_if_default() {
+  local var="$1" default="$2" prompt="$3" secret="${4:-false}"
+  local current="${!var}"
+  if [ "${current}" != "${default}" ]; then
+    return
+  fi
+  require_tty_for_prompt "${var}"
+  while true; do
+    local value confirm
+    if [ "${secret}" = "true" ]; then
+      read -rsp "${prompt}: " value; echo
+    else
+      read -rp "${prompt} [${default}]: " value
+    fi
+    if [ -z "${value}" ]; then
+      value="${current}"
+    fi
+    if [ "${value}" = "${default}" ]; then
+      read -rp "Value for ${var} is still default. Use it anyway? [y/N]: " confirm
+      if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+        continue
+      fi
+    fi
+    printf -v "${var}" '%s' "${value}"
+    break
+  done
+}
+
+prompt_db_list_if_default() {
+  local default="$1" prompt="$2"
+  local current="${DB_LIST[*]}"
+  current="${current#"${current%%[![:space:]]*}"}"
+  current="${current%"${current##*[![:space:]]}"}"
+  [ -z "${current}" ] && current="${default}"
+  if [ "${current}" != "${default}" ]; then
+    return
+  fi
+  require_tty_for_prompt "DB_LIST"
+  while true; do
+    local value confirm
+    read -rp "${prompt} [${default}]: " value
+    if [ -z "${value}" ]; then
+      value="${current}"
+    fi
+    if [ "${value}" = "${default}" ]; then
+      read -rp "Use default database list '${default}'? [y/N]: " confirm
+      if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+        continue
+      fi
+    fi
+    read -ra DB_LIST <<< "${value}"
+    break
+  done
+}
+
+# ---------- gather config ----------
+prompt_if_default "OLD_HOST" "old.example.com" "Source host (OLD_HOST)"
+prompt_if_default "NEW_HOST" "new.example.com" "Destination host (NEW_HOST)"
+prompt_if_default "OLD_WEB_ROOT" "/var/www/site" "Source web root absolute path (OLD_WEB_ROOT)"
+prompt_if_default "PLESK_DOMAIN" "example.com" "Plesk domain name (PLESK_DOMAIN)"
+prompt_if_default "PLESK_IP_ADDR" "203.0.113.10" "IPv4 address for subscription (PLESK_IP_ADDR)"
+prompt_if_default "PLESK_SYSTEM_USER" "siteuser" "System user for subscription (PLESK_SYSTEM_USER)"
+prompt_if_default "PLESK_SYSTEM_PASS" "changeme" "System user password (PLESK_SYSTEM_PASS)" "true"
+prompt_if_default "OLD_DB_PASS" "oldpass" "Source MySQL password (OLD_DB_PASS)" "true"
+prompt_if_default "NEW_DB_USER" "appuser" "Destination MySQL user (NEW_DB_USER)"
+prompt_if_default "NEW_DB_PASS" "newpass" "Destination MySQL password (NEW_DB_PASS)" "true"
+prompt_db_list_if_default "appdb analyticsdb" "Databases to migrate (space-separated)"
+
 SECONDS=0
 tic() { date +%s; }
 toc() { local s="$1"; echo "$(( $(date +%s) - s ))s"; }
@@ -182,7 +259,7 @@ trap cleanup EXIT
 LINE
 INFO "BEGIN migration (password‑friendly mode)"
 INFO "OLD ${OLD_USER}@${OLD_HOST}:${OLD_SSH_PORT}  NEW ${NEW_USER}@${NEW_HOST}:${NEW_SSH_PORT}"
-INFO "Roots: ${OLD_WEB_ROOT} -> ${NEW_WEB_ROOT} | Assets: ${ASSETS_DIR}"
+INFO "Roots: ${OLD_WEB_ROOT} -> ${NEW_WEB_ROOT:-'(auto)'} | Assets: ${ASSETS_DIR}"
 INFO "DBs: ${DB_LIST[*]}"
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   INFO "Plesk: enabled for ${PLESK_DOMAIN} (plan: ${PLESK_SERVICE_PLAN}, owner: ${PLESK_OWNER})"
@@ -222,10 +299,6 @@ for cmd in "${OPTIONAL[@]}"; do
 done
 echo "OLD host dependencies satisfied."
 REMOTE
-
-STEP "Preflight on NEW"
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
 
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   STEP "Ensure Plesk subscription and DB records"
@@ -278,6 +351,46 @@ for db in "${DB_ARRAY[@]}"; do
 done
 REMOTE
 fi
+
+STEP "Resolve NEW web root path"
+if [ -n "${NEW_WEB_ROOT}" ]; then
+  INFO "Using configured NEW_WEB_ROOT=${NEW_WEB_ROOT}"
+else
+  if [ "${PLESK_AUTO_SETUP}" != "true" ]; then
+    ERR "NEW_WEB_ROOT is empty and --plesk-setup was not used. Set NEW_WEB_ROOT manually."
+    exit 1
+  fi
+  NEW_WEB_ROOT="$(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    PLESK_DOMAIN="${PLESK_DOMAIN}" \
+    PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+if ! command -v plesk >/dev/null 2>&1; then
+  echo "" && exit 0
+fi
+docroot=$(plesk bin subscription --info "${PLESK_DOMAIN}" \
+  | awk -F': ' '/Document root/ {print $2; exit}')
+if [ -n "$docroot" ]; then
+  printf '%s\n' "$docroot"
+  exit 0
+fi
+wwwroot=$(plesk bin subscription --info "${PLESK_DOMAIN}" \
+  | awk -F': ' '/WWW root/ {print $2; exit}')
+if [ -n "$wwwroot" ] && [ -n "${PLESK_VHOSTS_ROOT}" ]; then
+  printf '%s/%s/%s\n' "${PLESK_VHOSTS_ROOT%/}" "${PLESK_DOMAIN}" "${wwwroot}"
+fi
+REMOTE
+)"
+  NEW_WEB_ROOT="$(echo -n "${NEW_WEB_ROOT}" | tr -d '\r')"
+  if [ -z "${NEW_WEB_ROOT}" ]; then
+    ERR "Failed to auto-detect NEW_WEB_ROOT from Plesk. Set it manually."
+    exit 1
+  fi
+  INFO "Auto-detected NEW_WEB_ROOT=${NEW_WEB_ROOT}"
+fi
+
+STEP "Preflight on NEW"
+ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
+ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
 
 STEP "Create local staging at ${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}/code" "${STAGE_DIR}/assets"
