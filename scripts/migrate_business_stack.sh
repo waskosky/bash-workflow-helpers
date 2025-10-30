@@ -505,6 +505,7 @@ if [ "${MIGRATE_CRONS_APPLY:-0}" = "1" ]; then
   systemctl reload cron || systemctl reload crond || true
   log "Cron jobs written under /etc/cron.d/migrated_* . Verify and monitor."
 fi
+EOF_60
 
 chmod +x /root/migration/migrate_services.sh /root/migration/subs/*.sh
 echo "Created. Next steps:"
