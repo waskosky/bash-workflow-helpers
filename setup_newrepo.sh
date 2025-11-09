@@ -4,6 +4,38 @@ set -euo pipefail
 log(){ printf '[setup] %s\n' "$*"; }
 err(){ printf '[setup] ERROR: %s\n' "$*" >&2; }
 
+MIN_GH_VERSION="2.4.0"
+
+version_lt() {
+  local IFS=. a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"
+  IFS=. read -r b1 b2 b3 <<<"$2"
+  a1=${a1:-0}; a2=${a2:-0}; a3=${a3:-0}
+  b1=${b1:-0}; b2=${b2:-0}; b3=${b3:-0}
+  if (( a1 < b1 )); then return 0; fi
+  if (( a1 > b1 )); then return 1; fi
+  if (( a2 < b2 )); then return 0; fi
+  if (( a2 > b2 )); then return 1; fi
+  if (( a3 < b3 )); then return 0; fi
+  if (( a3 > b3 )); then return 1; fi
+  return 1
+}
+
+ensure_min_gh_version() {
+  local required="$1" raw detected
+  raw="$(gh --version 2>/dev/null | head -n1 || true)"
+  detected="$(printf '%s\n' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+  if [[ -z "$detected" ]]; then
+    err "Unable to parse GitHub CLI version from: ${raw:-<empty>}"
+    exit 1
+  fi
+  if version_lt "$detected" "$required"; then
+    err "GitHub CLI $required or newer is required; detected $detected. Update via https://cli.github.com/."
+    exit 1
+  fi
+  log "GitHub CLI version $detected satisfies minimum requirement ($required+)."
+}
+
 safe_source() {
   local file="$1" had_e=0 had_u=0 status
   [[ -f "$file" ]] || return 1
@@ -65,6 +97,7 @@ if ! command -v gh >/dev/null 2>&1; then
   err "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/ and rerun."
   exit 1
 fi
+ensure_min_gh_version "$MIN_GH_VERSION"
 
 log "Checking GitHub CLI authentication status."
 if ! gh auth status >/dev/null 2>&1; then
