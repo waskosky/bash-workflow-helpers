@@ -14,6 +14,12 @@ NEW_SSH_PORT=22
 OLD_WEB_ROOT="/var/www/site"
 NEW_WEB_ROOT="/var/www/site"
 
+# SSH authentication (leave blank to use ssh-agent defaults)
+OLD_SSH_KEY_PATH=""
+OLD_SSH_PASSWORD=""
+NEW_SSH_KEY_PATH=""
+NEW_SSH_PASSWORD=""
+
 # Uploaded assets directory relative to the web root
 ASSETS_DIR="public/uploads"
 
@@ -61,15 +67,45 @@ pv_or_cat() { if command -v pv >/dev/null 2>&1; then echo "pv -brat"; else echo 
 SSH_CTL_DIR="${HOME}/.ssh/ctl-mux"
 mkdir -p "${SSH_CTL_DIR}"; chmod 700 "${SSH_CTL_DIR}"
 
+describe_ssh_auth() {
+  local prefix="$1"
+  local key_var="${prefix}_SSH_KEY_PATH"
+  local pass_var="${prefix}_SSH_PASSWORD"
+  if [ -n "${!pass_var:-}" ]; then
+    echo "password"
+  elif [ -n "${!key_var:-}" ]; then
+    echo "key: ${!key_var}"
+  else
+    echo "agent/default"
+  fi
+}
+
 open_master() { # name user host port
   local name="$1" user="$2" host="$3" port="$4"
+  local prefix="${name^^}"
+  local key_var="${prefix}_SSH_KEY_PATH"
+  local pass_var="${prefix}_SSH_PASSWORD"
+  local identity="${!key_var:-}"
+  local password="${!pass_var:-}"
+
   INFO "Opening SSH master to ${user}@${host}:${port} (you may be prompted)."
-  ssh -fN -tt \
-    -o ControlMaster=auto \
-    -o ControlPersist=600 \
-    -o StrictHostKeyChecking=accept-new \
-    -S "${SSH_CTL_DIR}/${name}" \
-    -p "${port}" "${user}@${host}" || { ERR "SSH master failed for ${host}"; exit 1; }
+  local ssh_base=(ssh -fN -tt
+    -o ControlMaster=auto
+    -o ControlPersist=600
+    -o StrictHostKeyChecking=accept-new
+    -S "${SSH_CTL_DIR}/${name}"
+    -p "${port}")
+  if [ -n "${identity}" ]; then
+    ssh_base+=(-i "${identity}")
+  fi
+  if [ -n "${password}" ] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -p "${password}" "${ssh_base[@]}" "${user}@${host}" || { ERR "SSH master failed for ${host}"; exit 1; }
+  else
+    if [ -n "${password}" ] && ! command -v sshpass >/dev/null 2>&1; then
+      WARN "sshpass not found; ${prefix} host will prompt for password interactively."
+    fi
+    "${ssh_base[@]}" "${user}@${host}" || { ERR "SSH master failed for ${host}"; exit 1; }
+  fi
   ssh -S "${SSH_CTL_DIR}/${name}" -O check -p "${port}" "${user}@${host}" >/dev/null
   INFO "SSH master ready for ${user}@${host}:${port}."
 }
@@ -98,6 +134,7 @@ INFO "BEGIN migration (password‑friendly mode)"
 INFO "OLD ${OLD_USER}@${OLD_HOST}:${OLD_SSH_PORT}  NEW ${NEW_USER}@${NEW_HOST}:${NEW_SSH_PORT}"
 INFO "Roots: ${OLD_WEB_ROOT} -> ${NEW_WEB_ROOT} | Assets: ${ASSETS_DIR}"
 INFO "DBs: ${DB_LIST[*]}"
+INFO "SSH auth: OLD=$(describe_ssh_auth OLD), NEW=$(describe_ssh_auth NEW)"
 LINE
 
 STEP "Open SSH sessions (prompts occur here)"
@@ -172,7 +209,7 @@ for db in "${DB_LIST[@]}"; do
   '" | ${PV} | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "bash -lc '
     set -euo pipefail
     export MYSQL_PWD=\"${NEW_DB_PASS}\"
-    if command -v ionice >/dev/null 2>&1; then WRAP=\"ionice -c2 -n7 nice -n  19\"; else WRAP=\"nice -n 19\"; fi
+    if command -v ionice >/dev/null 2>&1; then WRAP=\"ionice -c2 -n7 nice -n 19\"; else WRAP=\"nice -n 19\"; fi
     exec \$WRAP mysql -h \"${NEW_DB_HOST}\" -u \"${NEW_DB_USER}\" \"${db}\"
   '"
   INFO "DB ${db} migrated in $(toc "$START")"
