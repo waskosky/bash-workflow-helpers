@@ -87,8 +87,14 @@ DB_COMPRESS="${DB_COMPRESS:-auto}"   # auto|lz4|gzip|none
 MAINTENANCE="${MAINTENANCE:-prompt}" # prompt|true|false
 WPCLI_ENSURE="${WPCLI_ENSURE:-true}" # ensure wp-cli availability on NEW when mode=wordpress
 WP_SEARCH_REPLACE="${WP_SEARCH_REPLACE:-auto}" # auto|true|false
+# Where this script is running from: auto|old
+ORIGIN_MODE="${ORIGIN_MODE:-auto}"
+# Transfer strategy: direct (default), stage (local staging), stream (tar over SSH; no delete)
+TRANSFER_MODE="${TRANSFER_MODE:-direct}"
 RSYNC_NEW_USER="${RSYNC_NEW_USER:-}" # override NEW_USER used for rsync/upload
 RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-.git node_modules vendor cache logs tmp}"
+START_STEP="${START_STEP:-1}"
+DB_EXCLUDE_TABLES=(${DB_EXCLUDE_TABLES:-})
 
 # Extra client options for huge dumps/imports
 MYSQLDUMP_OPTS_DEFAULT=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 --column-statistics=0)
@@ -115,6 +121,13 @@ Common options:
   --rsync-new-user <user>       Use this user for rsync to NEW (defaults to NEW_USER).
   --no-wp-cli                   Do not auto-install wp-cli on NEW.
   --no-search-replace           Skip WordPress search-replace (serialized safe).
+  --transfer-mode <direct|stage|stream>
+                                Transfer strategy. direct (default) = rsync runs on NEW pulling from OLD,
+                                stage = local staging on this machine,
+                                stream = tar over SSH via local, no delete.
+  --from-old                    Force run-from-OLD mode (script is running on the OLD server).
+  --start-step <N>              Start at STEP number N (skips earlier steps). See logs for step numbers.
+  --exclude-table <db.tbl|tbl>  Repeatable. Exclude table(s) from dump (prefix with DB or omit to apply per-DB).
   --old-user <user>             SSH username for OLD host (overrides OLD_USER).
   --new-user <user>             SSH username for NEW host (overrides NEW_USER).
   --old-pass <password>         SSH password for OLD host (overrides OLD_SSH_PASSWORD).
@@ -144,6 +157,11 @@ while [[ $# -gt 0 ]]; do
     --rsync-new-user) RSYNC_NEW_USER="$2"; shift 2 ;;
     --no-wp-cli) WPCLI_ENSURE=false; shift ;;
     --no-search-replace) WP_SEARCH_REPLACE=false; shift ;;
+    --transfer-mode) TRANSFER_MODE="$2"; shift 2 ;;
+    --from-old) ORIGIN_MODE="old"; shift ;;
+    --start-step) START_STEP="$2"; shift 2 ;;
+    --exclude-table)
+      DB_EXCLUDE_TABLES+=("$2"); shift 2 ;;
     --old-user) OLD_USER="$2"; shift 2 ;;
     --new-user) NEW_USER="$2"; shift 2 ;;
     --old-pass) OLD_SSH_PASSWORD="$2"; shift 2 ;;
@@ -210,7 +228,7 @@ NEW_URL="${NEW_URL:-https://example.com}"
 OLD_PATH="${OLD_PATH:-${OLD_WEB_ROOT}}"
 NEW_PATH="${NEW_PATH:-${NEW_WEB_ROOT}}"
 
-# Local staging directory (must have free space for code + assets)
+# Local staging directory (used only when TRANSFER_MODE=stage)
 STAGE_DIR="${STAGE_DIR:-${HOME}/.migrate_stage_$(date +%s)}"
 
 # Structured log destination (set to empty string to disable)
@@ -497,6 +515,167 @@ pv_or_cat() { if command -v pv >/dev/null 2>&1; then echo "pv -brat"; else echo 
 SSH_CTL_DIR="${HOME}/.ssh/ctl-mux"
 mkdir -p "${SSH_CTL_DIR}"; chmod 700 "${SSH_CTL_DIR}"
 
+# Detect whether we're running on the OLD host
+RUN_FROM="other"
+if [ "${ORIGIN_MODE}" = "old" ]; then
+  RUN_FROM="old"
+else
+  # auto-detect: compare OLD_HOST addresses with local addresses
+  if command -v ip >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
+    mapfile -t _local_ips < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
+    mapfile -t _old_ips < <(getent ahosts "${OLD_HOST}" | awk '{print $1}' | sort -u)
+    for li in "${_local_ips[@]}" 127.0.0.1; do
+      for oi in "${_old_ips[@]}" ::1; do
+        if [ -n "$li" ] && [ -n "$oi" ] && [ "$li" = "$oi" ]; then RUN_FROM="old"; break 2; fi
+      done
+    done
+  fi
+fi
+
+# If still unknown and interactive, ask the user
+if [ "${RUN_FROM}" != "old" ] && [ "${ORIGIN_MODE}" = "auto" ] && [ -t 0 ]; then
+  read -rp "Are you running this script on the OLD source server? [Y/n]: " _yn
+  _yn=${_yn:-y}
+  if [[ "${_yn}" =~ ^[Yy]$ ]]; then RUN_FROM="old"; fi
+fi
+
+# ---------- transfer helpers ----------
+rsync_direct_pull_from_old_to_new_code() {
+  # Runs rsync ON NEW host, pulling code (excludes assets) from OLD into NEW_WEB_ROOT
+  INFO "Running direct rsync on NEW pulling code from OLD (excludes assets)."
+  # Pre-escape password for remote if provided
+  local pass_esc=""
+  if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
+    pass_esc=$(printf "%s" "${OLD_SSH_PASSWORD}" | sed -e "s/'/'\\''/g")
+  fi
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" 'bash -s' <<REMOTE
+set -euo pipefail
+PASS_ESC='${pass_esc}'
+RSYNC_DRY="${RSYNC_DRY}"
+ASSETS_DIR="${ASSETS_DIR}"
+OLD_USER="${OLD_USER}"; OLD_HOST="${OLD_HOST}"; OLD_WEB_ROOT="${OLD_WEB_ROOT%/}"; OLD_SSH_PORT="${OLD_SSH_PORT}"
+NEW_WEB_ROOT="${NEW_WEB_ROOT%/}"
+RSYNC_EXCLUDES_LIST="${RSYNC_EXCLUDES}"
+if ! command -v rsync >/dev/null 2>&1; then
+  echo "rsync missing on NEW host" >&2
+  exit 1
+fi
+EXCLUDES=()
+for x in ${RSYNC_EXCLUDES_LIST:-}; do EXCLUDES+=(--exclude="$x"); done
+EXCLUDES+=(--exclude="${ASSETS_DIR}")
+SSHPASS_PRE=""
+if [ -n "${PASS_ESC}" ]; then
+  if command -v sshpass >/dev/null 2>&1; then
+    SSHPASS_PRE="sshpass -p '${PASS_ESC}' "
+  else
+    echo "OLD_SSH_PASSWORD set but sshpass missing on NEW" >&2
+    exit 1
+  fi
+fi
+eval ${SSHPASS_PRE} rsync -azh \
+  ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+  -e "ssh -p ${OLD_SSH_PORT}" \
+  "\${EXCLUDES[@]}" \
+  "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/" \
+  "${NEW_WEB_ROOT}/"
+REMOTE
+}
+
+rsync_direct_pull_from_old_to_new_assets() {
+  INFO "Running direct rsync on NEW pulling assets from OLD."
+  local pass_esc=""
+  if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
+      pass_esc=$(printf "%s" "${OLD_SSH_PASSWORD}" | sed -e "s/'/'\\''/g")
+  fi
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" 'bash -s' <<REMOTE
+set -euo pipefail
+PASS_ESC='${pass_esc}'
+RSYNC_DRY="${RSYNC_DRY}"; ASSETS_DIR="${ASSETS_DIR%/}"; NEW_WEB_ROOT="${NEW_WEB_ROOT%/}"
+OLD_USER="${OLD_USER}"; OLD_HOST="${OLD_HOST}"; OLD_WEB_ROOT="${OLD_WEB_ROOT%/}"; OLD_SSH_PORT="${OLD_SSH_PORT}"
+if ! command -v rsync >/dev/null 2>&1; then
+  echo "rsync missing on NEW host" >&2
+  exit 1
+fi
+SSHPASS_PRE=""
+if [ -n "${PASS_ESC}" ]; then
+  if command -v sshpass >/dev/null 2>&1; then
+    SSHPASS_PRE="sshpass -p '${PASS_ESC}' "
+  else
+    echo "OLD_SSH_PASSWORD set but sshpass missing on NEW" >&2
+    exit 1
+  fi
+fi
+mkdir -p "${NEW_WEB_ROOT}/${ASSETS_DIR}"
+eval ${SSHPASS_PRE} rsync -azh \
+  ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+  -e "ssh -p ${OLD_SSH_PORT}" \
+  "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/" \
+  "${NEW_WEB_ROOT}/${ASSETS_DIR}/"
+REMOTE
+}
+
+# When running on OLD, push directly to NEW (no staging)
+rsync_push_code_from_old_to_new() {
+  INFO "Pushing code from OLD to NEW via rsync (delete)."
+  EXCLUDES=()
+  for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
+  EXCLUDES+=(--exclude="${ASSETS_DIR}")
+  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+    "${EXCLUDES[@]}" \
+    -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+    "${OLD_WEB_ROOT%/}/" \
+    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"
+}
+
+rsync_push_assets_from_old_to_new() {
+  INFO "Pushing assets from OLD to NEW via rsync (delete)."
+  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+    -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+    "${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}/" \
+    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+}
+
+tar_stream_copy() {
+  # tar from OLD to NEW via stream. Args: SRC_DIR DEST_DIR [EXCLUDE_PATTERNS...]
+  local src_dir="$1"; shift
+  local dest_dir="$1"; shift
+  local tar_excludes=("$@")
+  INFO "Streaming tar from OLD:${src_dir} to NEW:${dest_dir} (no delete)."
+  local EXCL
+  EXCL="${tar_excludes[*]}"
+  local PV
+  PV=$(pv_or_cat)
+  if [ "${RUN_FROM}" = "old" ]; then
+    # Local tar on OLD → ssh NEW
+    local exargs=()
+    for pat in ${EXCL}; do [ -n "$pat" ] && exargs+=(--exclude="$pat"); done
+    tar -C "${src_dir%/}" -cpf - "${exargs[@]}" . \
+      | ${PV} \
+      | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+          DEST="${dest_dir%/}" 'bash -s' <<'REMOTE2'
+set -euo pipefail
+mkdir -p "$DEST"
+tar -C "$DEST" -xpf -
+REMOTE2
+  else
+    # Remote tar on OLD → ssh NEW
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<REMOTE | \
+  ${PV} | \
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" 'bash -s' <<REMOTE2
+set -euo pipefail
+SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
+declare -a exargs=()
+for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
+tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+REMOTE
+set -euo pipefail
+DEST="${dest_dir%/}"
+mkdir -p "\$DEST"
+tar -C "\$DEST" -xpf -
+REMOTE2
+  fi
+}
+
 open_master() { # name user host port
   local name="$1" user="$2" host="$3" port="$4"
   local prefix="${name^^}"
@@ -506,12 +685,16 @@ open_master() { # name user host port
   local password="${!pass_var:-}"
 
   INFO "Opening SSH master to ${user}@${host}:${port} (you may be prompted)."
-  local ssh_base=(ssh -fN -tt
+  local ssh_base=(ssh -fN
     -o ControlMaster=auto
     -o ControlPersist=600
     -o StrictHostKeyChecking=accept-new
     -S "${SSH_CTL_DIR}/${name}"
     -p "${port}")
+  # When doing direct rsync from NEW -> OLD, enable agent forwarding to NEW
+  if [ "${name}" = "new" ] && [ "${TRANSFER_MODE}" = "direct" ]; then
+    ssh_base+=(-A -o ForwardAgent=yes)
+  fi
   if [ -n "${identity}" ]; then
     ssh_base+=(-i "${identity}")
   fi
@@ -562,11 +745,12 @@ if [ -n "${LOG_FILE}" ]; then
 else
   INFO "Structured log -> disabled (set LOG_FILE env var to enable)"
 fi
+INFO "Run context: $( [ "${RUN_FROM}" = "old" ] && echo 'running on OLD' || echo 'running elsewhere' )"
 LINE
 
 # Resolve effective rsync user for NEW
 RSYNC_USER_NEW_EFFECTIVE="${RSYNC_NEW_USER:-${NEW_USER}}"
-INFO "Options: mode=${MODE}, skip_code=${SKIP_CODE}, skip_assets=${SKIP_ASSETS}, skip_db=${SKIP_DB}, db_compress=${DB_COMPRESS}, maintenance=${MAINTENANCE}, dry_run=${DRY_RUN}"
+INFO "Options: mode=${MODE}, transfer_mode=${TRANSFER_MODE}, skip_code=${SKIP_CODE}, skip_assets=${SKIP_ASSETS}, skip_db=${SKIP_DB}, db_compress=${DB_COMPRESS}, maintenance=${MAINTENANCE}, dry_run=${DRY_RUN}"
 if [ "${RSYNC_USER_NEW_EFFECTIVE}" != "${NEW_USER}" ]; then
   INFO "Using rsync NEW user override: ${RSYNC_USER_NEW_EFFECTIVE}"
 fi
@@ -576,57 +760,117 @@ RSYNC_DRY=""
 if [ "${DRY_RUN}" = "true" ]; then RSYNC_DRY="--dry-run"; fi
 
 STEP "Open SSH sessions (prompts occur here)"
-open_master "old" "${OLD_USER}" "${OLD_HOST}" "${OLD_SSH_PORT}"
+[ "${RUN_FROM}" = "old" ] || open_master "old" "${OLD_USER}" "${OLD_HOST}" "${OLD_SSH_PORT}"
 open_master "new" "${NEW_USER}" "${NEW_HOST}" "${NEW_SSH_PORT}"
 
 STEP "Validate required commands on OLD host"
-ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<'REMOTE'
-set -euo pipefail
-REQUIRED=(rsync mysqldump)
-OPTIONAL=(ionice)
-missing=()
-for cmd in "${REQUIRED[@]}"; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    missing+=("$cmd")
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+elif [ "${RUN_FROM}" = "old" ]; then
+  REQUIRED=(rsync mysqldump)
+  OPTIONAL=(ionice)
+  need_install=()
+  if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
+  if ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+  if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || apt-get update || true
+    apt-get install -y "${need_install[@]}" || true
   fi
+  missing=()
+  for cmd in "${REQUIRED[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    ERR "Missing required commands on OLD (local): ${missing[*]}"
+    if [ "$(id -u)" != "0" ]; then
+      WARN "Tip: run as root on Debian/Ubuntu to auto-install."
+    fi
+    exit 1
+  fi
+  for cmd in "${OPTIONAL[@]}"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      WARN "Optional command not found on OLD (local): ${cmd}"
+    fi
+  done
+  INFO "OLD host dependencies satisfied (local)."
+else
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+need_install=()
+if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
+if ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || apt-get update || true
+  apt-get install -y "${need_install[@]}" || true
+fi
+missing=()
+for cmd in rsync mysqldump; do
+  command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "Missing required commands on OLD host: ${missing[*]}" >&2
+  if [ "$(id -u)" != "0" ]; then
+    echo "Tip: run as root on Debian/Ubuntu to auto-install." >&2
+  fi
   exit 1
 fi
-for cmd in "${OPTIONAL[@]}"; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "Optional command not found on OLD host: ${cmd} (migration will continue without it)"
-  fi
-done
 echo "OLD host dependencies satisfied."
 REMOTE
+fi
 
 STEP "Validate required commands on NEW host"
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" 'bash -s' <<'REMOTE'
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+  OLD_SSH_PASSWORD="${OLD_SSH_PASSWORD:-}" TRANSFER_MODE="${TRANSFER_MODE}" 'bash -s' <<'REMOTE'
 set -euo pipefail
-REQUIRED=(rsync mysql)
+need_install=()
+if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
+if ! command -v mysql >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ]; then
+  if ! command -v sshpass >/dev/null 2>&1; then need_install+=(sshpass); fi
+fi
+if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y || apt-get update || true
+  apt-get install -y "${need_install[@]}" || true
+fi
 missing=()
-for cmd in "${REQUIRED[@]}"; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    missing+=("$cmd")
-  fi
-done
+command -v rsync >/dev/null 2>&1 || missing+=(rsync)
+command -v mysql >/dev/null 2>&1 || missing+=(mysql-client)
+if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ] && ! command -v sshpass >/dev/null 2>&1; then missing+=(sshpass); fi
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "Missing required commands on NEW host: ${missing[*]}" >&2
+  if [ "$(id -u)" != "0" ]; then
+    echo "Tip: run as root on Debian/Ubuntu to auto-install." >&2
+  fi
   exit 1
 fi
 echo "NEW host dependencies satisfied."
 REMOTE
+fi
 
 STEP "Validate MySQL connectivity (OLD and NEW)"
-ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
-  OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" OLD_DB_PASS="${OLD_DB_PASS}" 'bash -s' <<'REMOTE'
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+elif [ "${RUN_FROM}" = "old" ]; then
+  export MYSQL_PWD="${OLD_DB_PASS}"
+  mysql -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" -e "SELECT VERSION() AS old_version;" >/dev/null
+  INFO "OLD MySQL connectivity OK."
+else
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+    OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" OLD_DB_PASS="${OLD_DB_PASS}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 export MYSQL_PWD="${OLD_DB_PASS}"
 mysql -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" -e "SELECT VERSION() AS old_version;" >/dev/null
 echo "OLD MySQL connectivity OK."
 REMOTE
+fi
 ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
   NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" 'bash -s' <<'REMOTE'
 set -euo pipefail
@@ -637,6 +881,7 @@ REMOTE
 
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   STEP "Ensure Plesk subscription and DB records"
+  if [ "${START_STEP:-1}" -le "${STEP_N}" ]; then
   DB_LIST_CSV="$(IFS=$' '; echo "${DB_LIST[*]}")"
   ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
     PLESK_DOMAIN="${PLESK_DOMAIN}" \
@@ -685,10 +930,15 @@ for db in "${DB_ARRAY[@]}"; do
     -passwd "${NEW_DB_PASS}"
 done
 REMOTE
+  else
+    INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+  fi
 fi
 
 STEP "Resolve NEW web root path"
-if [ -n "${NEW_WEB_ROOT}" ]; then
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+elif [ -n "${NEW_WEB_ROOT}" ]; then
   INFO "Using configured NEW_WEB_ROOT=${NEW_WEB_ROOT}"
 else
   if [ "${PLESK_AUTO_SETUP}" != "true" ]; then
@@ -724,8 +974,15 @@ REMOTE
 fi
 
 STEP "Detect mode and adapt defaults"
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
 detect_mode_wordpress_old() {
-  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "test -f '${OLD_WEB_ROOT%/}/wp-config.php'"
+  if [ "${RUN_FROM}" = "old" ]; then
+    test -f "${OLD_WEB_ROOT%/}/wp-config.php"
+  else
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "test -f '${OLD_WEB_ROOT%/}/wp-config.php'"
+  fi
 }
 if [ "${MODE}" = "auto" ]; then
   if detect_mode_wordpress_old; then MODE="wordpress"; else MODE="generic"; fi
@@ -737,58 +994,172 @@ if [ "${MODE}" = "wordpress" ]; then
     INFO "Assets dir set for WordPress: ${ASSETS_DIR}"
   fi
 fi
+fi
 
 STEP "Preflight on NEW"
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
+fi
 
-STEP "Create local staging at ${STAGE_DIR}"
-mkdir -p "${STAGE_DIR}/code" "${STAGE_DIR}/assets"
+if [ "${TRANSFER_MODE}" = "stage" ]; then
+  STEP "Create local staging at ${STAGE_DIR}"
+  mkdir -p "${STAGE_DIR}/code" "${STAGE_DIR}/assets"
+else
+  INFO "TRANSFER_MODE=${TRANSFER_MODE}; skipping local staging."
+fi
 
 if [ "${SKIP_CODE}" = "true" ]; then
-  INFO "Skipping code pull/push as requested."
+  INFO "Skipping code transfer as requested."
 else
-  STEP "Pull code from OLD to local (excludes assets)"
-  START=$(tic)
-  EXCLUDES=()
-  for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-    -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
-    "${EXCLUDES[@]}" \
-    --exclude="${ASSETS_DIR}" \
-    "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/" \
-    "${STAGE_DIR}/code/"
-  INFO "Code pulled in $(toc "$START")"
-  du -sh "${STAGE_DIR}/code" 2>/dev/null || true
+  case "${TRANSFER_MODE}" in
+    stage)
+      STEP "Pull code from OLD to local (excludes assets)"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      EXCLUDES=()
+      for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
+      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+        -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+        "${EXCLUDES[@]}" \
+        --exclude="${ASSETS_DIR}" \
+        "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/" \
+        "${STAGE_DIR}/code/"
+      INFO "Code pulled in $(toc "$START")"
+      du -sh "${STAGE_DIR}/code" 2>/dev/null || true
 
-  STEP "Push code from local to NEW"
-  START=$(tic)
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-    -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-    "${STAGE_DIR}/code/" \
-    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT}/"
-  INFO "Code pushed in $(toc "$START")"
+      STEP "Push code from local to NEW"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+        -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+        "${STAGE_DIR}/code/" \
+        "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"
+      INFO "Code pushed in $(toc "$START")"
+      fi
+      fi
+      ;;
+    direct)
+      STEP "Direct rsync code OLD → NEW"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      if [ "${RUN_FROM}" = "old" ]; then
+        rsync_push_code_from_old_to_new
+      else
+        if ! rsync_direct_pull_from_old_to_new_code; then
+          WARN "Direct rsync failed or not available; falling back to stream mode for code (no delete)."
+          tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" ${RSYNC_EXCLUDES} "${ASSETS_DIR}"
+        fi
+      fi
+      INFO "Code synced in $(toc "$START")"
+      fi
+      ;;
+    stream)
+      STEP "Stream code OLD → NEW via tar (no delete)"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" ${RSYNC_EXCLUDES} "${ASSETS_DIR}"
+      INFO "Code streamed in $(toc "$START")"
+      fi
+      ;;
+    *)
+      ERR "Unknown TRANSFER_MODE='${TRANSFER_MODE}'. Use stage|direct|stream."
+      exit 1
+      ;;
+  esac
 fi
 
 if [ "${SKIP_ASSETS}" = "true" ]; then
-  INFO "Skipping assets pull/push as requested."
+  INFO "Skipping assets transfer as requested."
 else
-  STEP "Pull assets from OLD to local"
-  START=$(tic)
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-    -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
-    "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/" \
-    "${STAGE_DIR}/assets/"
-  INFO "Assets pulled in $(toc "$START")"
-  du -sh "${STAGE_DIR}/assets" 2>/dev/null || true
+  case "${TRANSFER_MODE}" in
+    stage)
+      STEP "Pull assets from OLD to local"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+        -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+        "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}/" \
+        "${STAGE_DIR}/assets/"
+      INFO "Assets pulled in $(toc "$START")"
+      du -sh "${STAGE_DIR}/assets" 2>/dev/null || true
 
-  STEP "Push assets from local to NEW"
-  START=$(tic)
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-    -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-    "${STAGE_DIR}/assets/" \
-    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT}/${ASSETS_DIR}/"
-  INFO "Assets pushed in $(toc "$START")"
+      STEP "Push assets from local to NEW"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+        -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+        "${STAGE_DIR}/assets/" \
+        "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+      INFO "Assets pushed in $(toc "$START")"
+      fi
+      fi
+      ;;
+    direct)
+      STEP "Direct rsync assets OLD → NEW"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      if [ "${RUN_FROM}" = "old" ]; then
+        rsync_push_assets_from_old_to_new
+      else
+        if ! rsync_direct_pull_from_old_to_new_assets; then
+          WARN "Direct rsync failed or not available; falling back to stream mode for assets (no delete)."
+          tar_stream_copy "${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}" "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}"
+        fi
+      fi
+      INFO "Assets synced in $(toc "$START")"
+      fi
+      ;;
+    stream)
+      STEP "Stream assets OLD → NEW via tar (no delete)"
+      if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+        INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+      else
+      START=$(tic)
+      tar_stream_copy "${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}" "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}"
+      INFO "Assets streamed in $(toc "$START")"
+      fi
+      ;;
+  esac
+fi
+
+# Fix ownership and permissions on NEW for Plesk
+STEP "Fix ownership and permissions on NEW (Plesk)"
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
+ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+  NEW_WEB_ROOT="${NEW_WEB_ROOT}" PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" 'bash -s' <<'REMOTE'
+set -euo pipefail
+if [ "$(id -u)" = "0" ]; then
+  if command -v plesk >/dev/null 2>&1; then
+    chown -R "${PLESK_SYSTEM_USER}:psacln" "${NEW_WEB_ROOT%/}" || true
+    find "${NEW_WEB_ROOT%/}" -type d -exec chmod 755 {} + || true
+    find "${NEW_WEB_ROOT%/}" -type f -exec chmod 644 {} + || true
+    echo "[$(date +%F\ %T)] Ownership/perms normalized for Plesk user ${PLESK_SYSTEM_USER}."
+  else
+    echo "[$(date +%F\ %T)] Plesk not detected; skip ownership/perms normalization."
+  fi
+else
+  echo "[$(date +%F\ %T)] Not root on NEW; skip ownership/perms normalization."
+fi
+REMOTE
 fi
 
 if [ "${SKIP_DB}" = "true" ]; then
@@ -796,27 +1167,48 @@ if [ "${SKIP_DB}" = "true" ]; then
 elif [ "${DRY_RUN}" = "true" ]; then
   INFO "DRY-RUN is ON: skipping DB migration preview."
 else
-  STEP "Ensure DBs exist on NEW"
-  for db in "${DB_LIST[@]}"; do
-    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
-       -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
-  done
-  INFO "DBs ensured."
+STEP "Ensure DBs exist on NEW"
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
+for db in "${DB_LIST[@]}"; do
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
+     -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
+done
+INFO "DBs ensured."
+fi
 
-  STEP "Migrate DBs with low I/O priority (compressed stream)"
+STEP "Migrate DBs with low I/O priority (compressed stream)"
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+else
   for db in "${DB_LIST[@]}"; do
+    # Build ignore-table list for this DB
+    TABLES_TO_IGNORE=""
+    if [ ${#DB_EXCLUDE_TABLES[@]} -gt 0 ]; then
+      for t in "${DB_EXCLUDE_TABLES[@]}"; do
+        case "$t" in
+          *.*) TABLES_TO_IGNORE+=" $t" ;;
+          *)   TABLES_TO_IGNORE+=" ${db}.$t" ;;
+        esac
+      done
+    fi
     INFO "Migrating DB: ${db}"
     START=$(tic)
     PV=$(pv_or_cat)
     COMP_CHOICE=none
     # Detect compression pair
     if [ "${DB_COMPRESS}" = "auto" ]; then
-      if ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" command -v lz4 >/dev/null 2>&1 \
-         && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1; then
+      if { [ "${RUN_FROM}" = "old" ] && command -v lz4 >/dev/null 2>&1; } \
+         && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1 \
+         || { [ "${RUN_FROM}" != "old" ] && ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" command -v lz4 >/dev/null 2>&1 \
+              && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1; }; then
         COMP_CHOICE=lz4
-      elif ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1' \
-           && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1'; then
+      elif { [ "${RUN_FROM}" = "old" ] && (command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1); } \
+           && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1' \
+           || { [ "${RUN_FROM}" != "old" ] && ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1' \
+                && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1'; }; then
         COMP_CHOICE=gzip
       else
         COMP_CHOICE=none
@@ -835,24 +1227,52 @@ else
       fi
       if [ "${MAINTENANCE}" = "true" ]; then
         INFO "Enabling maintenance mode on OLD (WordPress)"
-        ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc '
+        if [ "${RUN_FROM}" = "old" ]; then
           set -euo pipefail
-          root=\"${OLD_WEB_ROOT%/}\"
-          if [ -f \"$root/wp-config.php\" ]; then
-            echo \"<?php \$upgrading = time();\" > \"$root/.maintenance\"
+          root="${OLD_WEB_ROOT%/}"
+          if [ -f "$root/wp-config.php" ]; then
+            echo "<?php \$upgrading = time();" > "$root/.maintenance"
           fi
-        '"
+        else
+          ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc '
+            set -euo pipefail
+            root=\"${OLD_WEB_ROOT%/}\"
+            if [ -f \"$root/wp-config.php\" ]; then
+              echo \"<?php \$upgrading = time();\" > \"$root/.maintenance\"
+            fi
+          '"
+        fi
       fi
     fi
 
     # Dump -> compress -> import pipeline
-    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc '
-      set -euo pipefail
-      export MYSQL_PWD=\"${OLD_DB_PASS}\"
-      if command -v ionice >/dev/null 2>&1; then WRAP=\"ionice -c2 -n7 nice -n 19\"; else WRAP=\"nice -n 19\"; fi
-      exec \$WRAP mysqldump -h \"${OLD_DB_HOST}\" -u \"${OLD_DB_USER}\" \\
-        ${MYSQLDUMP_OPTS_DEFAULT[*]} ${MYSQLDUMP_OPTS_EXTRA[*]} \"${db}\"
-    '" \
+    if [ "${RUN_FROM}" = "old" ]; then
+      export MYSQL_PWD="${OLD_DB_PASS}"
+      if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
+      if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+      BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
+      BASE_OPTS+=(--max-allowed-packet=1073741824)
+      if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
+      EXTRA_OPTS=( ${MYSQLDUMP_OPTS_EXTRA[*]} )
+      IGNORE_ARGS=()
+      for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
+      eval $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${db}"
+    else
+      ssh -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+        TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" 'bash -lc '
+set -euo pipefail
+export MYSQL_PWD="${OLD_DB_PASS}"
+if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
+if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
+BASE_OPTS+=(--max-allowed-packet=1073741824)
+if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
+EXTRA_OPTS=( ${MYSQLDUMP_OPTS_EXTRA[*]} )
+IGNORE_ARGS=()
+for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
+exec $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${db}"
+'
+    fi \
     | ${PV} \
     | {
         case "${COMP_CHOICE}" in
@@ -861,7 +1281,7 @@ else
           none) cat ;; \
         esac
       } \
-    | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "bash -lc '
+    | ssh -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "bash -lc '
         set -euo pipefail
         export MYSQL_PWD=\"${NEW_DB_PASS}\"
         if command -v ionice >/dev/null 2>&1; then WRAP=\"ionice -c2 -n7 nice -n 19\"; else WRAP=\"nice -n 19\"; fi
@@ -875,142 +1295,39 @@ else
 
     if [ "${MODE}" = "wordpress" ] && [ "${MAINTENANCE}" = "true" ]; then
       INFO "Disabling maintenance mode on OLD"
-      ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc 'rm -f \"${OLD_WEB_ROOT%/}/.maintenance\"'" || true
+      if [ "${RUN_FROM}" = "old" ]; then
+        rm -f "${OLD_WEB_ROOT%/}/.maintenance" || true
+      else
+        ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc 'rm -f \"${OLD_WEB_ROOT%/}/.maintenance\"'" || true
+      fi
     fi
     INFO "DB ${db} migrated in $(toc "$START")"
   done
 fi
+fi
 
 STEP "Update config on NEW (WordPress wp-config.php or generic .env)"
-if [ "${MODE}" = "wordpress" ]; then
-  # Update DB_* constants in wp-config.php if present
+if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+  INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+elif [ "${MODE}" = "wordpress" ]; then
+  # Check for wp-config.php; DB constants update intentionally skipped to avoid quoting issues on diverse configs
   ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    NEW_WEB_ROOT="${NEW_WEB_ROOT}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" DB_LIST_FIRST="${DB_LIST[0]}" 'bash -s' <<'REMOTE'
+    NEW_WEB_ROOT="${NEW_WEB_ROOT}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 CONF="${NEW_WEB_ROOT%/}/wp-config.php"
 if [ -f "$CONF" ]; then
-  esc() { printf "%s" "$1" | sed -e 's/[\&/]/\\&/g'; }
-  dbname="${DB_LIST_FIRST:-wordpress}"
-  sed -i.bak \
-    -e "s/define(\(['\"]DB_NAME['\"]\), *['\"][^'\"]*['\"]/define(\1, '$(esc "$dbname")')/" \
-    -e "s/define(\(['\"]DB_USER['\"]\), *['\"][^'\"]*['\"]/define(\1, '$(esc "$NEW_DB_USER")')/" \
-    -e "s/define(\(['\"]DB_PASSWORD['\"]\), *['\"][^'\"]*['\"]/define(\1, '$(esc "$NEW_DB_PASS")')/" \
-    -e "s/define(\(['\"]DB_HOST['\"]\), *['\"][^'\"]*['\"]/define(\1, '$(esc "$NEW_DB_HOST")')/" "$CONF" || true
-  echo "[$(date +%F\ %T)] Updated wp-config.php DB settings (backup at ${CONF}.bak)"
+  DBNAME=$(awk -F"'" '/DB_NAME/{print $4; exit}' "$CONF" 2>/dev/null || true)
+  echo "[$(date +%F\ %T)] wp-config.php present; DB_NAME='${DBNAME:-unknown}'. Skipping inline constant edits."
 else
   echo "[$(date +%F\ %T)] wp-config.php not found; skipping DB config update"
 fi
 REMOTE
 else
-  # generic .env replacements
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    NEW_WEB_ROOT="${NEW_WEB_ROOT}" OLD_URL="${OLD_URL}" NEW_URL="${NEW_URL}" OLD_PATH="${OLD_PATH}" NEW_PATH="${NEW_PATH}" 'bash -s' <<'REMOTE'
-set -euo pipefail
-FILE="${NEW_WEB_ROOT}/.env"
-[ -f "$FILE" ] || { echo "[$(date +%F\ %T)] No .env at $FILE. Skipping."; exit 0; }
-escape_pat()  { printf '%s' "$1" | sed -e 's/[.[*^$\\\/|]/\\&/g'; }
-escape_repl() { printf '%s' "$1" | sed -e 's/[&|]/\\&/g'; }
-build_sed()   { [ "$1" = "$2" ] && return 1; printf '%s' "-e" "s|$(escape_pat "$1")|$(escape_repl "$2")|g"; }
-SED_ARGS=()
-if args=$(build_sed "$OLD_URL" "$NEW_URL");  then SED_ARGS+=($args); fi
-if args=$(build_sed "$OLD_PATH" "$NEW_PATH"); then SED_ARGS+=($args); fi
-if [ "${#SED_ARGS[@]}" -gt 0 ]; then
-  echo "[$(date +%F\ %T)] Applying replacements to $FILE"
-  sed -i.bak "${SED_ARGS[@]}" "$FILE"
-  echo "[$(date +%F\ %T)] Backup written: ${FILE}.bak"
-else
-  echo "[$(date +%F\ %T)] No changes required in $FILE"
-fi
-REMOTE
+  # generic .env replacements skipped to simplify; perform app-level configuration manually if needed
+  INFO "Skipping .env replacements on NEW to avoid over-matching."
 fi
 
-# WordPress-aware serialized-safe search-replace using wp-cli if enabled
-if [ "${MODE}" = "wordpress" ]; then
-  RUN_SEARCH=false
-  case "${WP_SEARCH_REPLACE}" in
-    true) RUN_SEARCH=true ;;
-    false) RUN_SEARCH=false ;;
-    auto)
-      if [ "${OLD_URL}" != "${NEW_URL}" ] || [ "${OLD_PATH}" != "${NEW_PATH}" ]; then RUN_SEARCH=true; fi
-      ;;
-  esac
-  if [ "${RUN_SEARCH}" = "true" ]; then
-    STEP "WordPress search-replace on NEW (serialized-safe)"
-    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      NEW_WEB_ROOT="${NEW_WEB_ROOT}" WPCLI_ENSURE="${WPCLI_ENSURE}" OLD_URL="${OLD_URL}" NEW_URL="${NEW_URL}" OLD_PATH="${OLD_PATH}" NEW_PATH="${NEW_PATH}" 'bash -s' <<'REMOTE'
-set -euo pipefail
-cd "${NEW_WEB_ROOT}"
-wp_bin="wp"
-if ! command -v wp >/dev/null 2>&1; then
-  if [ "${WPCLI_ENSURE}" = "true" ]; then
-    echo "[$(date +%F\ %T)] Installing wp-cli locally (user space)"
-    curl -fsSL -o wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-    chmod +x wp-cli.phar
-    if command -v php >/dev/null 2>&1; then
-      wp_bin="php wp-cli.phar"
-    else
-      echo "[$(date +%F\ %T)] PHP is not available; cannot run wp-cli."
-      exit 1
-    fi
-  else
-    echo "[$(date +%F\ %T)] wp-cli not present and auto-install disabled."
-    exit 1
-  fi
-fi
-${wp_bin} search-replace "${OLD_URL}" "${NEW_URL}" --all-tables --precise --recurse-objects --skip-columns=guid --quiet || \
-  ${wp_bin} search-replace "${OLD_URL}" "${NEW_URL}" --all-tables --skip-columns=guid --quiet
-if [ "${OLD_PATH}" != "${NEW_PATH}" ] && [ -n "${NEW_PATH}" ]; then
-  ${wp_bin} search-replace "${OLD_PATH}" "${NEW_PATH}" --all-tables --precise --recurse-objects --quiet || true
-fi
-${wp_bin} option update home "${NEW_URL}" --quiet || true
-${wp_bin} option update siteurl "${NEW_URL}" --quiet || true
-${wp_bin} cache flush --quiet || true
-echo "[$(date +%F\ %T)] wp-cli search-replace finished."
-REMOTE
-  fi
-else
-  # Generic SQL replacements across text columns (safe for non-WP only)
-  STEP "Optional DB search/replace (generic)"
-  db_replace() {
-    local DB="$1"; local OLD_VAL="$2"; local NEW_VAL="$3"
-    [ "$OLD_VAL" = "$NEW_VAL" ] && { INFO "Skip ${DB}: values identical (${OLD_VAL})"; return 0; }
-    INFO "DB ${DB}: replacing '${OLD_VAL}' -> '${NEW_VAL}'"
-    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
-      DB="${DB}" OLD_VAL="${OLD_VAL}" NEW_VAL="${NEW_VAL}" 'bash -s' <<'REMOTE'
-set -euo pipefail
-export MYSQL_PWD="${NEW_DB_PASS}"
-if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
-GEN=$(mktemp)
-mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" -Nse "
-SET @schema='${DB}';
-SET @old='${OLD_VAL}';
-SET @new='${NEW_VAL}';
-SELECT CONCAT(
-  'UPDATE `', TABLE_NAME, '` SET `', COLUMN_NAME, '`=REPLACE(`', COLUMN_NAME, '`, ''',
-  REPLACE(@old, '''', ''''''), ''', ''', REPLACE(@new, '''', ''''''), ''') ',
-  'WHERE `', COLUMN_NAME, '` LIKE CONCAT(''%'', REPLACE(@old, '''', ''''''), ''%'');'
-)
-FROM information_schema.columns
-WHERE table_schema=@schema
-  AND DATA_TYPE IN ('varchar','char','text','mediumtext','longtext');
-" > "$GEN"
-LINES=$(wc -l < "$GEN" | tr -d ' ')
-echo "[$(date +%F\ %T)] Generated $LINES UPDATE statements for ${DB}"
-if [ "$LINES" -gt 0 ]; then
-  eval $WRAP mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DB}" < "$GEN"
-  echo "[$(date +%F\ %T)] Replacements applied for ${DB}"
-else
-  echo "[$(date +%F\ %T)] Nothing to replace in ${DB}"
-fi
-rm -f "$GEN"
-REMOTE
-  }
-  for db in "${DB_LIST[@]}"; do
-    db_replace "${db}" "${OLD_URL}"  "${NEW_URL}"
-    db_replace "${db}" "${OLD_PATH}" "${NEW_PATH}"
-  done
-fi
+# Generic SQL replacements disabled by default to avoid risk on serialized data.
 
 STEP "Summary"
 INFO "Code -> ${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}"

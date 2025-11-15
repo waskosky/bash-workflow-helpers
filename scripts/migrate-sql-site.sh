@@ -43,8 +43,15 @@ NEW_URL="https://example.com"
 OLD_PATH="${OLD_WEB_ROOT}"
 NEW_PATH="${NEW_WEB_ROOT}"
 
-# Local staging directory (must have free space for code + assets)
-STAGE_DIR="${HOME}/.migrate_stage_$(date +%s)"
+# Local staging directory (must have free space for code + assets) when TRANSFER_MODE=stage
+STAGE_DIR="${STAGE_DIR:-${HOME}/.migrate_stage_$(date +%s)}"
+
+# Transfer strategy:
+#   stage  - (default) pull to local, then push to NEW
+#   direct - run rsync on NEW pulling from OLD (uses agent forwarding if possible)
+#   stream - stream via tar over SSH through the local machine (no delete on NEW)
+# Set with: TRANSFER_MODE=direct ./migrate-sql-site.sh
+TRANSFER_MODE="${TRANSFER_MODE:-stage}"
 # ---------- END EDITS ----------
 
 # ---------- logging ----------
@@ -66,6 +73,61 @@ pv_or_cat() { if command -v pv >/dev/null 2>&1; then echo "pv -brat"; else echo 
 
 SSH_CTL_DIR="${HOME}/.ssh/ctl-mux"
 mkdir -p "${SSH_CTL_DIR}"; chmod 700 "${SSH_CTL_DIR}"
+
+# ---------- transfer helpers ----------
+rsync_direct_pull_from_old_to_new_code() {
+  # Runs rsync ON NEW host, pulling code (excludes assets) from OLD into NEW_WEB_ROOT
+  INFO "Running direct rsync on NEW pulling code from OLD (excludes assets)."
+  local excludes=(
+    "--exclude=.git" "--exclude=node_modules" "--exclude=vendor"
+    "--exclude=cache" "--exclude=logs" "--exclude=tmp"
+    "--exclude=${ASSETS_DIR}"
+  )
+  local rsh_old=(ssh -p "${OLD_SSH_PORT}")
+  local auth_prefix=""
+  # If password is provided for OLD and sshpass exists on NEW, use it
+  if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
+    auth_prefix='sshpass -p '"'${OLD_SSH_PASSWORD}'"' '
+  fi
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    "bash -lc 'set -euo pipefail; ${auth_prefix}rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -p ${OLD_SSH_PORT}" ${excludes[*]} \
+      "'"'${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/'"'" \
+      "'"'${NEW_WEB_ROOT}/'"'"'"
+}
+
+rsync_direct_pull_from_old_to_new_assets() {
+  INFO "Running direct rsync on NEW pulling assets from OLD."
+  local rsh_old=(ssh -p "${OLD_SSH_PORT}")
+  local auth_prefix=""
+  if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
+    auth_prefix='sshpass -p '"'${OLD_SSH_PASSWORD}'"' '
+  fi
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    "bash -lc 'set -euo pipefail; mkdir -p "'"'${NEW_WEB_ROOT}/${ASSETS_DIR}'"'"; ${auth_prefix}rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -p ${OLD_SSH_PORT}" \
+      "'"'${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/'"'" \
+      "'"'${NEW_WEB_ROOT}/${ASSETS_DIR}/'"'"'"
+}
+
+tar_stream_copy() {
+  # tar from OLD to NEW via local stdin/stdout. Args: SRC_DIR DEST_DIR ADDITIONAL_TAR_EXCLUDES...
+  local src_dir="$1"; shift
+  local dest_dir="$1"; shift
+  local tar_excludes=("$@")
+  INFO "Streaming tar from OLD:${src_dir} to NEW:${dest_dir} (no delete)."
+  # Build exclude args for GNU tar
+  local exargs=()
+  for pat in "${tar_excludes[@]}"; do
+    exargs+=(--exclude="$pat")
+  done
+  local PV=$(pv_or_cat)
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+    "bash -lc 'set -euo pipefail; tar -C "'"'${src_dir}'"' -cpf - ${exargs[*]} .'" | \
+  ${PV} | \
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    "bash -lc 'set -euo pipefail; mkdir -p "'"'${dest_dir}'"' && tar -C "'"'${dest_dir}'"' -xpf -'"
+}
 
 describe_ssh_auth() {
   local prefix="$1"
@@ -95,6 +157,10 @@ open_master() { # name user host port
     -o StrictHostKeyChecking=accept-new
     -S "${SSH_CTL_DIR}/${name}"
     -p "${port}")
+  # When doing direct rsync from NEW -> OLD, enable agent forwarding to NEW
+  if [ "${name}" = "new" ] && [ "${TRANSFER_MODE}" = "direct" ]; then
+    ssh_base+=(-A -o ForwardAgent=yes)
+  fi
   if [ -n "${identity}" ]; then
     ssh_base+=(-i "${identity}")
   fi
@@ -145,45 +211,93 @@ STEP "Preflight on NEW"
 ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
 ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
 
-STEP "Create local staging at ${STAGE_DIR}"
-mkdir -p "${STAGE_DIR}/code" "${STAGE_DIR}/assets"
+if [ "${TRANSFER_MODE}" = "stage" ]; then
+  STEP "Create local staging at ${STAGE_DIR}"
+  mkdir -p "${STAGE_DIR}/code" "${STAGE_DIR}/assets"
+else
+  INFO "TRANSFER_MODE=${TRANSFER_MODE}; skipping local staging."
+fi
 
-STEP "Pull code from OLD to local (excludes assets)"
-START=$(tic)
-rsync -azh --delete --stats --info=progress2 --human-readable \
-  -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
-  --exclude=".git" --exclude="node_modules" --exclude="vendor" \
-  --exclude="cache" --exclude="logs" --exclude="tmp" \
-  --exclude="${ASSETS_DIR}" \
-  "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/" \
-  "${STAGE_DIR}/code/"
-INFO "Code pulled in $(toc "$START")"
-du -sh "${STAGE_DIR}/code" 2>/dev/null || true
+case "${TRANSFER_MODE}" in
+  stage)
+    STEP "Pull code from OLD to local (excludes assets)"
+    START=$(tic)
+    rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+      --exclude=".git" --exclude="node_modules" --exclude="vendor" \
+      --exclude="cache" --exclude="logs" --exclude="tmp" \
+      --exclude="${ASSETS_DIR}" \
+      "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/" \
+      "${STAGE_DIR}/code/"
+    INFO "Code pulled in $(toc "$START")"
+    du -sh "${STAGE_DIR}/code" 2>/dev/null || true
 
-STEP "Push code from local to NEW"
-START=$(tic)
-rsync -azh --delete --stats --info=progress2 --human-readable \
-  -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-  "${STAGE_DIR}/code/" \
-  "${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}/"
-INFO "Code pushed in $(toc "$START")"
+    STEP "Push code from local to NEW"
+    START=$(tic)
+    rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+      "${STAGE_DIR}/code/" \
+      "${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}/"
+    INFO "Code pushed in $(toc "$START")"
+    ;;
+  direct)
+    STEP "Direct rsync code OLD → NEW (remote rsync on NEW)"
+    START=$(tic)
+    if ! rsync_direct_pull_from_old_to_new_code; then
+      WARN "Direct rsync failed or not available; falling back to stream mode for code (no delete)."
+      tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" \
+        ".git" "node_modules" "vendor" "cache" "logs" "tmp" "${ASSETS_DIR}"
+    fi
+    INFO "Code synced in $(toc "$START")"
+    ;;
+  stream)
+    STEP "Stream code OLD → NEW via tar (no delete)"
+    START=$(tic)
+    tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" \
+      ".git" "node_modules" "vendor" "cache" "logs" "tmp" "${ASSETS_DIR}"
+    INFO "Code streamed in $(toc "$START")"
+    ;;
+  *)
+    ERR "Unknown TRANSFER_MODE='${TRANSFER_MODE}'. Use stage|direct|stream."
+    exit 1
+    ;;
+esac
 
-STEP "Pull assets from OLD to local"
-START=$(tic)
-rsync -azh --delete --stats --info=progress2 --human-readable \
-  -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
-  "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/" \
-  "${STAGE_DIR}/assets/"
-INFO "Assets pulled in $(toc "$START")"
-du -sh "${STAGE_DIR}/assets" 2>/dev/null || true
+case "${TRANSFER_MODE}" in
+  stage)
+    STEP "Pull assets from OLD to local"
+    START=$(tic)
+    rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+      "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/" \
+      "${STAGE_DIR}/assets/"
+    INFO "Assets pulled in $(toc "$START")"
+    du -sh "${STAGE_DIR}/assets" 2>/dev/null || true
 
-STEP "Push assets from local to NEW"
-START=$(tic)
-rsync -azh --delete --stats --info=progress2 --human-readable \
-  -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-  "${STAGE_DIR}/assets/" \
-  "${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}/${ASSETS_DIR}/"
-INFO "Assets pushed in $(toc "$START")"
+    STEP "Push assets from local to NEW"
+    START=$(tic)
+    rsync -azh --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+      "${STAGE_DIR}/assets/" \
+      "${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}/${ASSETS_DIR}/"
+    INFO "Assets pushed in $(toc "$START")"
+    ;;
+  direct)
+    STEP "Direct rsync assets OLD → NEW (remote rsync on NEW)"
+    START=$(tic)
+    if ! rsync_direct_pull_from_old_to_new_assets; then
+      WARN "Direct rsync failed or not available; falling back to stream mode for assets (no delete)."
+      tar_stream_copy "${OLD_WEB_ROOT}/${ASSETS_DIR}" "${NEW_WEB_ROOT}/${ASSETS_DIR}"
+    fi
+    INFO "Assets synced in $(toc "$START")"
+    ;;
+  stream)
+    STEP "Stream assets OLD → NEW via tar (no delete)"
+    START=$(tic)
+    tar_stream_copy "${OLD_WEB_ROOT}/${ASSETS_DIR}" "${NEW_WEB_ROOT}/${ASSETS_DIR}"
+    INFO "Assets streamed in $(toc "$START")"
+    ;;
+esac
 
 STEP "Ensure DBs exist on NEW"
 for db in "${DB_LIST[@]}"; do
