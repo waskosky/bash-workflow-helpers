@@ -192,7 +192,15 @@ if git rev-parse --verify HEAD >/dev/null 2>&1; then
     GIT_AUTHOR_EMAIL="$USE_EMAIL" GIT_COMMITTER_EMAIL="$USE_EMAIL" git commit --amend --no-edit --reset-author >/dev/null
   fi
 else
-  say "No commits present; leaving working tree empty."
+  say "No commits present; creating placeholder README."
+  placeholder_ts="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  {
+    printf '# %s\n\n' "$TITLE"
+    printf 'This is a placeholder README created on %s.\n' "$placeholder_ts"
+  } > README.md
+  git add README.md
+  git commit -m "Add placeholder README" >/dev/null
+  HAS_COMMITS=1
 fi
 
 REMOTE_SSH="git@github.com:${OWNER}/${REPO}.git"

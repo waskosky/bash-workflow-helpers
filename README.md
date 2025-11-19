@@ -76,6 +76,7 @@ What it does:
 - Verifies GitHub CLI auth; refreshes scopes if needed and supports web login.
 - Creates the repo under your user or an org (default visibility private; override with `VISIBILITY=public|internal`).
 - Configures your local Git identity to GitHub’s noreply address (avoids GH007 policy blocks) and amends if needed.
+- Seeds new repos with a timestamped placeholder `README.md` so there is always initial content.
 - Pushes existing commits to `origin` on `main` (skips push if no commits).
 - Optionally registers the local repo in GitHub Desktop (macOS, Windows, WSL, Linux with `xdg-open`).
 - Uses conservative timeouts to avoid hanging on network issues.
