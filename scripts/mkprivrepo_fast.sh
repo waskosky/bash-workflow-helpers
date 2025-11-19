@@ -151,44 +151,6 @@ require_auth() {
   rm -f "$auth_err"
 }
 
-get_gh_token() {
-  local token status hosts_file
-
-  if token="$(gh auth token 2>/dev/null)"; then
-    token="$(printf '%s' "$token" | tr -d '[:space:]')"
-    if [[ -n "$token" ]]; then
-      printf '%s' "$token"
-      return 0
-    fi
-  fi
-
-  if status="$(gh auth status -t 2>/dev/null)"; then
-    token="$(printf '%s\n' "$status" | awk '/Token:/ {print $2; exit}')"
-    token="$(printf '%s' "${token:-}" | tr -d '[:space:]')"
-    if [[ -n "$token" && "$token" != "(none)" ]]; then
-      printf '%s' "$token"
-      return 0
-    fi
-  fi
-
-  hosts_file="${XDG_CONFIG_HOME:-$HOME/.config}/gh/hosts.yml"
-  if [[ -f "$hosts_file" ]]; then
-    token="$(awk -v host='github.com:' '
-      BEGIN {found=0}
-      $1 == host {found=1; next}
-      found && /oauth_token:/ {print $2; exit}
-      found && NF==0 {found=0}
-    ' "$hosts_file")"
-    token="$(printf '%s' "${token:-}" | tr -d '[:space:]')"
-    if [[ -n "$token" && "$token" != "(none)" ]]; then
-      printf '%s' "$token"
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
 
 # ---- start ----
 require_auth
@@ -233,29 +195,11 @@ else
   say "No commits present; leaving working tree empty."
 fi
 
-REMOTE_PROTOCOL_DEFAULT="ssh"
-if [[ -n "${REMOTE_PROTOCOL:-}" ]]; then
-  REMOTE_PROTOCOL_DEFAULT="${REMOTE_PROTOCOL}"
-else
-  gh_proto="$(gh config get git_protocol 2>/dev/null || true)"
-  if [[ "$gh_proto" =~ ^(ssh|https)$ ]]; then
-    REMOTE_PROTOCOL_DEFAULT="$gh_proto"
-  fi
-fi
-case "$REMOTE_PROTOCOL_DEFAULT" in
-  https)
-    REMOTE_URL="https://github.com/${OWNER}/${REPO}.git"
-    ;;
-  ssh|*)
-    REMOTE_URL="git@github.com:${OWNER}/${REPO}.git"
-    REMOTE_PROTOCOL_DEFAULT="ssh"
-    ;;
-esac
-say "Configuring git origin using $REMOTE_PROTOCOL_DEFAULT"
+REMOTE_SSH="git@github.com:${OWNER}/${REPO}.git"
 if git remote get-url origin >/dev/null 2>&1; then
-  git remote set-url origin "$REMOTE_URL"
+  git remote set-url origin "$REMOTE_SSH"
 else
-  git remote add origin "$REMOTE_URL"
+  git remote add origin "$REMOTE_SSH"
 fi
 
 # ---- ensure remote exists ----
@@ -276,9 +220,7 @@ sanitize_desc() {  # remove ASCII control chars (incl. CR, LF, TAB)
 
 post_github_json() { # $1=endpoint (starts with /), $2=json payload, $3=output file for the response body; echoes HTTP code
   local endpoint="$1" payload="$2" output="$3" token url code curl_max
-  if ! token="$(get_gh_token)"; then
-    die 15 "Unable to read GitHub auth token. Upgrade GitHub CLI or rerun 'gh auth login'."
-  fi
+  token="$(gh auth token)" || { echo 0; return 1; }
   url="https://api.github.com$endpoint"
   curl_max="${HTTP_TIMEOUT%s}"
   code="$(
@@ -394,5 +336,5 @@ fi
 
 say "Done"
 echo "Local: $DEST"
-echo "Remote: $REMOTE_URL"
+echo "Remote: $REMOTE_SSH"
 echo "Author email used: $USE_EMAIL"

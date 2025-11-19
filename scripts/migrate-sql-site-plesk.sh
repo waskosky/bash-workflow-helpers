@@ -84,6 +84,7 @@ SKIP_ASSETS="${SKIP_ASSETS:-false}"
 SKIP_DB="${SKIP_DB:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 DB_COMPRESS="${DB_COMPRESS:-auto}"   # auto|lz4|gzip|none
+DB_MODE="${DB_MODE:-buffer}"         # buffer|stream|auto (default: buffer for robustness)
 MAINTENANCE="${MAINTENANCE:-prompt}" # prompt|true|false
 WPCLI_ENSURE="${WPCLI_ENSURE:-true}" # ensure wp-cli availability on NEW when mode=wordpress
 WP_SEARCH_REPLACE="${WP_SEARCH_REPLACE:-auto}" # auto|true|false
@@ -115,7 +116,10 @@ Common options:
   --skip-db                     Skip database migration.
   --only-db                     Shortcut for --skip-code --skip-assets
   --db-compress <auto|lz4|gzip|none>
-                                Compress DB stream (auto prefers lz4, then gzip).
+                          Compress DB stream (auto prefers lz4, then gzip).
+  --db-mode <buffer|stream|auto>
+                          DB transfer strategy. buffer (default) writes dump to NEW then imports;
+                          stream uses OLD→NEW pipe; auto tries stream then falls back to buffer.
   --maintenance                 Put source WordPress in maintenance during DB dump.
   --no-maintenance              Do not use maintenance even for WordPress.
   --rsync-new-user <user>       Use this user for rsync to NEW (defaults to NEW_USER).
@@ -152,6 +156,7 @@ while [[ $# -gt 0 ]]; do
     --skip-db) SKIP_DB=true; shift ;;
     --only-db) SKIP_CODE=true; SKIP_ASSETS=true; shift ;;
     --db-compress) DB_COMPRESS="$2"; shift 2 ;;
+    --db-mode) DB_MODE="$2"; shift 2 ;;
     --maintenance) MAINTENANCE=true; shift ;;
     --no-maintenance) MAINTENANCE=false; shift ;;
     --rsync-new-user) RSYNC_NEW_USER="$2"; shift 2 ;;
@@ -1147,17 +1152,30 @@ else
 ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
   NEW_WEB_ROOT="${NEW_WEB_ROOT}" PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" 'bash -s' <<'REMOTE'
 set -euo pipefail
-if [ "$(id -u)" = "0" ]; then
-  if command -v plesk >/dev/null 2>&1; then
-    chown -R "${PLESK_SYSTEM_USER}:psacln" "${NEW_WEB_ROOT%/}" || true
-    find "${NEW_WEB_ROOT%/}" -type d -exec chmod 755 {} + || true
-    find "${NEW_WEB_ROOT%/}" -type f -exec chmod 644 {} + || true
-    echo "[$(date +%F\ %T)] Ownership/perms normalized for Plesk user ${PLESK_SYSTEM_USER}."
-  else
-    echo "[$(date +%F\ %T)] Plesk not detected; skip ownership/perms normalization."
-  fi
+ts() { date +%F\ %T; }
+if [ "$(id -u)" != "0" ]; then
+  echo "[$(ts)] Not root on NEW; skip ownership/perms normalization."
+  exit 0
+fi
+if ! command -v plesk >/dev/null 2>&1; then
+  echo "[$(ts)] Plesk not detected; skip ownership/perms normalization."
+  exit 0
+fi
+# Determine target user/group
+tgt_user=""; tgt_group=""
+if [ -n "${PLESK_SYSTEM_USER}" ] && id -u "${PLESK_SYSTEM_USER}" >/dev/null 2>&1; then
+  tgt_user="${PLESK_SYSTEM_USER}"; tgt_group="psacln"
 else
-  echo "[$(date +%F\ %T)] Not root on NEW; skip ownership/perms normalization."
+  tgt_user="$(stat -c '%U' "${NEW_WEB_ROOT%/}" 2>/dev/null || true)"
+  tgt_group="$(stat -c '%G' "${NEW_WEB_ROOT%/}" 2>/dev/null || true)"
+fi
+if [ -n "${tgt_user}" ] && id -u "${tgt_user}" >/dev/null 2>&1; then
+  chown -R "${tgt_user}:${tgt_group:-psacln}" "${NEW_WEB_ROOT%/}" || true
+  find "${NEW_WEB_ROOT%/}" -type d -exec chmod 755 {} + || true
+  find "${NEW_WEB_ROOT%/}" -type f -exec chmod 644 {} + || true
+  echo "[$(ts)] Ownership/perms normalized for user ${tgt_user} group ${tgt_group:-psacln}."
+else
+  echo "[$(ts)] Could not determine valid system user; skipping chown."
 fi
 REMOTE
 fi
@@ -1179,11 +1197,15 @@ done
 INFO "DBs ensured."
 fi
 
-STEP "Migrate DBs with low I/O priority (compressed stream)"
+STEP "Migrate DBs with low I/O priority (DB_MODE=${DB_MODE}, compressed ${DB_COMPRESS})"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
   for db in "${DB_LIST[@]}"; do
+    # Ensure target DB exists even when resuming at this step
+    ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
+       -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" || true
     # Build ignore-table list for this DB
     TABLES_TO_IGNORE=""
     if [ ${#DB_EXCLUDE_TABLES[@]} -gt 0 ]; then
@@ -1245,8 +1267,64 @@ else
       fi
     fi
 
-    # Dump -> compress -> import pipeline
-    if [ "${RUN_FROM}" = "old" ]; then
+    # Buffered mode helper: dump -> compress -> store file on NEW -> import -> cleanup
+    db_import_buffer() {
+      local DBNAME="$1" TMPFILE comp_ext comp_send comp_decomp WRAP IGNORE_ARGS_STR
+      WRAP=$(io_wrap)
+      case "${COMP_CHOICE}" in
+        lz4) comp_ext="sql.lz4"; comp_send="lz4 -1"; comp_decomp="lz4 -dc" ;;
+        gzip) comp_ext="sql.gz"; comp_send="gzip -1"; comp_decomp="zcat" ;;
+        none) comp_ext="sql"; comp_send="cat"; comp_decomp="cat" ;;
+      esac
+      TMPFILE="$(ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mktemp /tmp/${DBNAME}.XXXX.${comp_ext}")"
+      INFO "Uploading dump to NEW: ${TMPFILE}"
+      IGNORE_ARGS_STR=""
+      for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
+      if [ "${RUN_FROM}" = "old" ]; then
+        export MYSQL_PWD="${OLD_DB_PASS}"
+        local DUMP
+        if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+        local BASE_OPTS
+        BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
+        if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
+        eval ${WRAP:-} "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" ${IGNORE_ARGS_STR} "${DBNAME}" \
+          | ${comp_send} \
+          | ${PV} \
+          | ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "cat > '${TMPFILE}'"
+      else
+        ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+          OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
+          DBNAME="${DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_SEND="${comp_send}" 'bash -s' <<'REMOTE_OLD_BUF' \
+          | ${PV} \
+          | ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "cat > '${TMPFILE}'"
+set -euo pipefail
+export MYSQL_PWD="${OLD_DB_PASS}"
+if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+IGNORE_ARGS_STR=""
+for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
+eval "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" \
+  --single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 \
+  ${IGNORE_ARGS_STR} "${DBNAME}" | ${COMP_SEND}
+REMOTE_OLD_BUF
+      fi
+      INFO "Importing ${TMPFILE} on NEW"
+      ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+        NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
+        TMPFILE="${TMPFILE}" comp_decomp="${comp_decomp}" DBNAME="${DBNAME}" 'bash -s' <<'REMOTE_IMP'
+set -euo pipefail
+export MYSQL_PWD="${NEW_DB_PASS}"
+{ echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; ${comp_decomp} "${TMPFILE}"; } \
+  | mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
+rm -f "${TMPFILE}"
+REMOTE_IMP
+    }
+
+    # Dump -> compress -> import: choose mode
+    if [ "${DB_MODE}" = "buffer" ]; then
+      db_import_buffer "${db}"
+    elif [ "${DB_MODE}" = "stream" ]; then
+      # Legacy stream pipeline
+      if [ "${RUN_FROM}" = "old" ]; then
       export MYSQL_PWD="${OLD_DB_PASS}"
       if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
       if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
@@ -1258,8 +1336,9 @@ else
       for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
       eval $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${db}"
     else
-      ssh -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
-        TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" 'bash -lc '
+      ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+        OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
+        TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" DBNAME="${db}" 'bash -s' <<'REMOTE_OLD'
 set -euo pipefail
 export MYSQL_PWD="${OLD_DB_PASS}"
 if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
@@ -1267,11 +1346,11 @@ if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP=
 BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
 BASE_OPTS+=(--max-allowed-packet=1073741824)
 if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
-EXTRA_OPTS=( ${MYSQLDUMP_OPTS_EXTRA[*]} )
+EXTRA_OPTS=()
 IGNORE_ARGS=()
 for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
-exec $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${db}"
-'
+exec $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${DBNAME}"
+REMOTE_OLD
     fi \
     | ${PV} \
     | {
@@ -1281,17 +1360,25 @@ exec $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${
           none) cat ;; \
         esac
       } \
-    | ssh -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "bash -lc '
-        set -euo pipefail
-        export MYSQL_PWD=\"${NEW_DB_PASS}\"
-        if command -v ionice >/dev/null 2>&1; then WRAP=\"ionice -c2 -n7 nice -n 19\"; else WRAP=\"nice -n 19\"; fi
-        case \"${COMP_CHOICE}\" in
-          lz4)  IN=\"lz4 -d\" ;;
-          gzip) IN=\"gzip -d\" ;;
-          none) IN=\"cat\" ;;
-        esac
-        eval \$IN | \$WRAP mysql -h \"${NEW_DB_HOST}\" -u \"${NEW_DB_USER}\" ${MYSQL_IMPORT_OPTS_DEFAULT[*]} ${MYSQL_IMPORT_OPTS_EXTRA[*]} \"${db}\"
-      '"
+    | ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+        NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
+        COMP_CHOICE="${COMP_CHOICE}" DBNAME="${db}" 'bash -s' <<'REMOTE_NEW'
+set -euo pipefail
+set -o pipefail
+export MYSQL_PWD="${NEW_DB_PASS}"
+if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
+case "${COMP_CHOICE}" in
+  lz4)  IN="lz4 -d" ;;
+  gzip) IN="gzip -d" ;;
+  none) IN="cat" ;;
+esac
+{ echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; eval $IN; } \
+  | eval $WRAP mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
+REMOTE_NEW
+    else
+      # Auto or unknown: robust default to buffered mode
+      db_import_buffer "${db}"
+    fi
 
     if [ "${MODE}" = "wordpress" ] && [ "${MAINTENANCE}" = "true" ]; then
       INFO "Disabling maintenance mode on OLD"
@@ -1333,7 +1420,11 @@ STEP "Summary"
 INFO "Code -> ${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}"
 INFO "Assets -> ${NEW_USER}@${NEW_HOST}:${NEW_WEB_ROOT}/${ASSETS_DIR}"
 INFO "DBs migrated: ${DB_LIST[*]}"
-INFO "URL replace:  $( [ "${OLD_URL}" = "${NEW_URL}" ] && echo 'skipped' || echo "${OLD_URL} -> ${NEW_URL}" )"
-INFO "Path replace: $( [ "${OLD_PATH}" = "${NEW_PATH}" ] && echo 'skipped' || echo "${OLD_PATH} -> ${NEW_PATH}" )"
-INFO "Plesk provisioning: $( [ "${PLESK_AUTO_SETUP}" = "true" ] && echo "enabled for ${PLESK_DOMAIN}" || echo 'disabled' )"
-INFO "Structured log file: $( [ -n "${LOG_FILE}" ] && echo "${LOG_FILE}" || echo 'disabled' )"
+if [ "${OLD_URL}" = "${NEW_URL}" ]; then url_summary="skipped"; else url_summary="${OLD_URL} -> ${NEW_URL}"; fi
+INFO "URL replace: ${url_summary}"
+if [ "${OLD_PATH}" = "${NEW_PATH}" ]; then path_summary="skipped"; else path_summary="${OLD_PATH} -> ${NEW_PATH}"; fi
+INFO "Path replace: ${path_summary}"
+if [ "${PLESK_AUTO_SETUP}" = "true" ]; then plesk_summary="enabled for ${PLESK_DOMAIN}"; else plesk_summary="disabled"; fi
+INFO "Plesk provisioning: ${plesk_summary}"
+if [ -n "${LOG_FILE}" ]; then log_summary="${LOG_FILE}"; else log_summary="disabled"; fi
+INFO "Structured log file: ${log_summary}"
