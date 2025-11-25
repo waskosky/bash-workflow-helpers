@@ -93,9 +93,23 @@ ORIGIN_MODE="${ORIGIN_MODE:-auto}"
 # Transfer strategy: direct (default), stage (local staging), stream (tar over SSH; no delete)
 TRANSFER_MODE="${TRANSFER_MODE:-direct}"
 RSYNC_NEW_USER="${RSYNC_NEW_USER:-}" # override NEW_USER used for rsync/upload
-RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-.git node_modules vendor cache logs tmp}"
+RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-cache logs tmp}"
 START_STEP="${START_STEP:-1}"
 DB_EXCLUDE_TABLES=(${DB_EXCLUDE_TABLES:-})
+
+# Legacy safety: stop excluding vendor so plugin/composer deps migrate
+if [[ " ${RSYNC_EXCLUDES} " == *" vendor "* ]]; then
+  read -r -a _rsync_ex_arr <<< "${RSYNC_EXCLUDES}"
+  RSYNC_EXCLUDES=""
+  declare -A _rsync_seen=()
+  for item in "${_rsync_ex_arr[@]}"; do
+    [ "$item" = "vendor" ] && continue
+    if [[ -z "${_rsync_seen[$item]:-}" ]]; then
+      RSYNC_EXCLUDES="${RSYNC_EXCLUDES:+${RSYNC_EXCLUDES} }${item}"
+      _rsync_seen[$item]=1
+    fi
+  done
+fi
 
 # Extra client options for huge dumps/imports
 MYSQLDUMP_OPTS_DEFAULT=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 --column-statistics=0)
