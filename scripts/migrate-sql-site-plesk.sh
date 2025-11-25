@@ -943,16 +943,17 @@ fi
 STEP "Resolve NEW web root path"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
-elif [ -n "${NEW_WEB_ROOT}" ]; then
-  INFO "Using configured NEW_WEB_ROOT=${NEW_WEB_ROOT}"
 else
-  if [ "${PLESK_AUTO_SETUP}" != "true" ]; then
-    ERR "NEW_WEB_ROOT is empty and --plesk-setup was not used. Set NEW_WEB_ROOT manually."
-    exit 1
-  fi
-  NEW_WEB_ROOT="$(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    PLESK_DOMAIN="${PLESK_DOMAIN}" \
-    PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" 'bash -s' <<'REMOTE'
+  # Determine suggested web root
+  local_default_root="${NEW_WEB_ROOT}"
+  if [ -z "${local_default_root}" ]; then
+    if [ "${PLESK_AUTO_SETUP}" != "true" ]; then
+      ERR "NEW_WEB_ROOT is empty and --plesk-setup was not used. Set NEW_WEB_ROOT manually."
+      exit 1
+    fi
+    local_default_root="$(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      PLESK_DOMAIN="${PLESK_DOMAIN}" \
+      PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 if ! command -v plesk >/dev/null 2>&1; then
   echo "" && exit 0
@@ -970,12 +971,24 @@ if [ -n "$wwwroot" ] && [ -n "${PLESK_VHOSTS_ROOT}" ]; then
 fi
 REMOTE
 )"
-  NEW_WEB_ROOT="$(echo -n "${NEW_WEB_ROOT}" | tr -d '\r')"
-  if [ -z "${NEW_WEB_ROOT}" ]; then
-    ERR "Failed to auto-detect NEW_WEB_ROOT from Plesk. Set it manually."
-    exit 1
+    local_default_root="$(echo -n "${local_default_root}" | tr -d '\r')"
+    if [ -z "${local_default_root}" ]; then
+      ERR "Failed to auto-detect NEW_WEB_ROOT from Plesk. Set it manually."
+      exit 1
+    fi
+    INFO "Auto-detected NEW_WEB_ROOT default: ${local_default_root}"
+  else
+    INFO "Configured NEW_WEB_ROOT default: ${local_default_root}"
   fi
-  INFO "Auto-detected NEW_WEB_ROOT=${NEW_WEB_ROOT}"
+
+  # If interactive, let user adjust; otherwise trust default
+  if [ -t 0 ]; then
+    read -rp "Destination NEW web root [${local_default_root}]: " _new_root
+    NEW_WEB_ROOT="${_new_root:-${local_default_root}}"
+  else
+    NEW_WEB_ROOT="${local_default_root}"
+  fi
+  INFO "Using NEW_WEB_ROOT=${NEW_WEB_ROOT}"
 fi
 
 STEP "Detect mode and adapt defaults"
