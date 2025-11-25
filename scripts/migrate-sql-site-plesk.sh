@@ -93,7 +93,7 @@ ORIGIN_MODE="${ORIGIN_MODE:-auto}"
 # Transfer strategy: direct (default), stage (local staging), stream (tar over SSH; no delete)
 TRANSFER_MODE="${TRANSFER_MODE:-direct}"
 RSYNC_NEW_USER="${RSYNC_NEW_USER:-}" # override NEW_USER used for rsync/upload
-RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-cache logs tmp}"
+RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-logs tmp}"
 START_STEP="${START_STEP:-1}"
 DB_EXCLUDE_TABLES=(${DB_EXCLUDE_TABLES:-})
 
@@ -420,6 +420,25 @@ prompt_db_list_if_default() {
   done
 }
 
+confirm_db_migration_needed() {
+  # Interactive guard to avoid prompting for DB details when not needed
+  if [ "${SKIP_DB}" = "true" ]; then
+    DB_LIST=()
+    return
+  fi
+  [ -t 0 ] || return
+  require_tty_for_prompt "SKIP_DB"
+  local ans
+  read -rp "Does this site have a database to migrate? [Y/n]: " ans
+  ans=${ans:-y}
+  if [[ ! "${ans}" =~ ^[Yy]$ ]]; then
+    SKIP_DB=true
+    DB_LIST=()
+    OLD_DB_HOST=""; OLD_DB_USER=""; OLD_DB_PASS=""
+    NEW_DB_HOST=""; NEW_DB_USER=""; NEW_DB_PASS=""
+  fi
+}
+
 prompt_ssh_auth() {
   local prefix="$1"
   local host_var="${prefix}_HOST"
@@ -500,13 +519,18 @@ if [ -t 0 ]; then
   prompt_var PLESK_IP_ADDR "IPv4 address for subscription (PLESK_IP_ADDR)"
   prompt_var PLESK_SYSTEM_USER "System user for subscription (PLESK_SYSTEM_USER)"
   prompt_secret PLESK_SYSTEM_PASS "System user password (PLESK_SYSTEM_PASS)"
-  prompt_var OLD_DB_HOST "Source MySQL host (OLD_DB_HOST)"
-  prompt_var OLD_DB_USER "Source MySQL user (OLD_DB_USER)"
-  prompt_secret OLD_DB_PASS "Source MySQL password (OLD_DB_PASS)"
-  prompt_var NEW_DB_HOST "Destination MySQL host (NEW_DB_HOST)"
-  prompt_var NEW_DB_USER "Destination MySQL user (NEW_DB_USER)"
-  prompt_secret NEW_DB_PASS "Destination MySQL password (NEW_DB_PASS)"
-  prompt_db_list "Databases to migrate (space-separated)"
+  confirm_db_migration_needed
+  if [ "${SKIP_DB}" != "true" ]; then
+    prompt_var OLD_DB_HOST "Source MySQL host (OLD_DB_HOST)"
+    prompt_var OLD_DB_USER "Source MySQL user (OLD_DB_USER)"
+    prompt_secret OLD_DB_PASS "Source MySQL password (OLD_DB_PASS)"
+    prompt_var NEW_DB_HOST "Destination MySQL host (NEW_DB_HOST)"
+    prompt_var NEW_DB_USER "Destination MySQL user (NEW_DB_USER)"
+    prompt_secret NEW_DB_PASS "Destination MySQL password (NEW_DB_PASS)"
+    prompt_db_list "Databases to migrate (space-separated)"
+  else
+    DB_LIST=()
+  fi
   prompt_var ASSETS_DIR "Assets directory relative to web root (ASSETS_DIR)"
   prompt_var OLD_URL "Old site URL (OLD_URL)"
   prompt_var NEW_URL "New site URL (NEW_URL)"
@@ -514,6 +538,11 @@ if [ -t 0 ]; then
   prompt_ssh_auth "NEW"
   # Save all to persistent defaults
   save_config
+fi
+
+# If DB is skipped (env/flag/interactive), clear DB list to avoid confusion
+if [ "${SKIP_DB}" = "true" ]; then
+  DB_LIST=()
 fi
 
 # If not using Plesk auto-setup and NEW_WEB_ROOT is empty, prompt for it now
@@ -752,7 +781,11 @@ LINE
 INFO "BEGIN migration (resilient mode)"
 INFO "OLD ${OLD_USER}@${OLD_HOST}:${OLD_SSH_PORT}  NEW ${NEW_USER}@${NEW_HOST}:${NEW_SSH_PORT}"
 INFO "Roots: ${OLD_WEB_ROOT} -> ${NEW_WEB_ROOT:-'(auto)'} | Assets: ${ASSETS_DIR}"
-INFO "DBs: ${DB_LIST[*]}"
+if [ "${SKIP_DB}" = "true" ]; then
+  INFO "DBs: skipped"
+else
+  INFO "DBs: ${DB_LIST[*]}"
+fi
 INFO "SSH auth: OLD=$(describe_ssh_auth OLD), NEW=$(describe_ssh_auth NEW)"
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   INFO "Plesk: enabled for ${PLESK_DOMAIN} (plan: ${PLESK_SERVICE_PLAN}, owner: ${PLESK_OWNER})"
@@ -786,11 +819,14 @@ STEP "Validate required commands on OLD host"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 elif [ "${RUN_FROM}" = "old" ]; then
-  REQUIRED=(rsync mysqldump)
+  REQUIRED=(rsync)
+  if [ "${SKIP_DB}" != "true" ]; then
+    REQUIRED+=(mysqldump)
+  fi
   OPTIONAL=(ionice)
   need_install=()
   if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
-  if ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+  if [ "${SKIP_DB}" != "true" ] && ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
   if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y || apt-get update || true
@@ -816,20 +852,20 @@ elif [ "${RUN_FROM}" = "old" ]; then
   done
   INFO "OLD host dependencies satisfied (local)."
 else
-  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<'REMOTE'
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+    SKIP_DB="${SKIP_DB}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 need_install=()
 if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
-if ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysqldump >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
 if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y || apt-get update || true
   apt-get install -y "${need_install[@]}" || true
 fi
 missing=()
-for cmd in rsync mysqldump; do
-  command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-done
+command -v rsync >/dev/null 2>&1 || missing+=(rsync)
+if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysqldump >/dev/null 2>&1; then missing+=(mysqldump); fi
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "Missing required commands on OLD host: ${missing[*]}" >&2
   if [ "$(id -u)" != "0" ]; then
@@ -846,11 +882,11 @@ if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
   ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-  OLD_SSH_PASSWORD="${OLD_SSH_PASSWORD:-}" TRANSFER_MODE="${TRANSFER_MODE}" 'bash -s' <<'REMOTE'
+  OLD_SSH_PASSWORD="${OLD_SSH_PASSWORD:-}" TRANSFER_MODE="${TRANSFER_MODE}" SKIP_DB="${SKIP_DB}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 need_install=()
 if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
-if ! command -v mysql >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysql >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
 if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ]; then
   if ! command -v sshpass >/dev/null 2>&1; then need_install+=(sshpass); fi
 fi
@@ -861,7 +897,7 @@ if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get
 fi
 missing=()
 command -v rsync >/dev/null 2>&1 || missing+=(rsync)
-command -v mysql >/dev/null 2>&1 || missing+=(mysql-client)
+if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysql >/dev/null 2>&1; then missing+=(mysql-client); fi
 if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ] && ! command -v sshpass >/dev/null 2>&1; then missing+=(sshpass); fi
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "Missing required commands on NEW host: ${missing[*]}" >&2
@@ -875,7 +911,9 @@ REMOTE
 fi
 
 STEP "Validate MySQL connectivity (OLD and NEW)"
-if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
+if [ "${SKIP_DB}" = "true" ]; then
+  INFO "Skipping database connectivity checks (no database migration requested)."
+elif [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 elif [ "${RUN_FROM}" = "old" ]; then
   export MYSQL_PWD="${OLD_DB_PASS}"
@@ -890,6 +928,7 @@ mysql -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" -e "SELECT VERSION() AS old_versio
 echo "OLD MySQL connectivity OK."
 REMOTE
 fi
+if [ "${SKIP_DB}" != "true" ]; then
 ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
   NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" 'bash -s' <<'REMOTE'
 set -euo pipefail
@@ -897,6 +936,7 @@ export MYSQL_PWD="${NEW_DB_PASS}"
 mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" -e "SELECT VERSION() AS new_version;" >/dev/null
 echo "NEW MySQL connectivity OK."
 REMOTE
+fi
 
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   STEP "Ensure Plesk subscription and DB records"
