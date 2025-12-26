@@ -88,7 +88,7 @@ DB_MODE="${DB_MODE:-buffer}"         # buffer|stream|auto (default: buffer for r
 MAINTENANCE="${MAINTENANCE:-prompt}" # prompt|true|false
 WPCLI_ENSURE="${WPCLI_ENSURE:-true}" # ensure wp-cli availability on NEW when mode=wordpress
 WP_SEARCH_REPLACE="${WP_SEARCH_REPLACE:-auto}" # auto|true|false
-# Where this script is running from: auto|old
+# Where this script is running from: auto|old|new|other
 ORIGIN_MODE="${ORIGIN_MODE:-auto}"
 # Transfer strategy: direct (default), stage (local staging), stream (tar over SSH; no delete)
 TRANSFER_MODE="${TRANSFER_MODE:-direct}"
@@ -144,6 +144,7 @@ Common options:
                                 stage = local staging on this machine,
                                 stream = tar over SSH via local, no delete.
   --from-old                    Force run-from-OLD mode (script is running on the OLD server).
+  --from-new                    Force run-from-NEW mode (script is running on the NEW server).
   --start-step <N>              Start at STEP number N (skips earlier steps). See logs for step numbers.
   --exclude-table <db.tbl|tbl>  Repeatable. Exclude table(s) from dump (prefix with DB or omit to apply per-DB).
   --old-user <user>             SSH username for OLD host (overrides OLD_USER).
@@ -178,6 +179,7 @@ while [[ $# -gt 0 ]]; do
     --no-search-replace) WP_SEARCH_REPLACE=false; shift ;;
     --transfer-mode) TRANSFER_MODE="$2"; shift 2 ;;
     --from-old) ORIGIN_MODE="old"; shift ;;
+    --from-new) ORIGIN_MODE="new"; shift ;;
     --start-step) START_STEP="$2"; shift 2 ;;
     --exclude-table)
       DB_EXCLUDE_TABLES+=("$2"); shift 2 ;;
@@ -195,12 +197,15 @@ done
 
 # ---------- EDIT THESE ----------
 # Hosts, users, ports, and paths
-OLD_HOST="${OLD_HOST:-old.example.com}"
-OLD_USER="${OLD_USER:-ubuntu}"
+OLD_HOST_DEFAULT="old.example.com"
+NEW_HOST_DEFAULT="new.example.com"
+DEFAULT_SSH_USER="ubuntu"
+OLD_HOST="${OLD_HOST:-${OLD_HOST_DEFAULT}}"
+OLD_USER="${OLD_USER:-${DEFAULT_SSH_USER}}"
 OLD_SSH_PORT=${OLD_SSH_PORT:-22}
 
-NEW_HOST="${NEW_HOST:-new.example.com}"
-NEW_USER="${NEW_USER:-ubuntu}"
+NEW_HOST="${NEW_HOST:-${NEW_HOST_DEFAULT}}"
+NEW_USER="${NEW_USER:-${DEFAULT_SSH_USER}}"
 NEW_SSH_PORT=${NEW_SSH_PORT:-22}
 
 OLD_WEB_ROOT="${OLD_WEB_ROOT:-/var/www/site}"
@@ -441,6 +446,10 @@ confirm_db_migration_needed() {
 
 prompt_ssh_auth() {
   local prefix="$1"
+  if { [ "${prefix}" = "OLD" ] && [ "${RUN_FROM:-}" = "old" ]; } \
+    || { [ "${prefix}" = "NEW" ] && [ "${RUN_FROM:-}" = "new" ]; }; then
+    return
+  fi
   local host_var="${prefix}_HOST"
   local user_var="${prefix}_USER"
   local key_var="${prefix}_SSH_KEY_PATH"
@@ -493,8 +502,96 @@ prompt_ssh_auth() {
   done
 }
 
+detect_run_from() {
+  local guess="other"
+  if command -v ip >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
+    mapfile -t _local_ips < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
+    mapfile -t _old_ips < <(getent ahosts "${OLD_HOST}" | awk '{print $1}' | sort -u)
+    mapfile -t _new_ips < <(getent ahosts "${NEW_HOST}" | awk '{print $1}' | sort -u)
+    for li in "${_local_ips[@]}" 127.0.0.1; do
+      for oi in "${_old_ips[@]}" ::1; do
+        if [ -n "$li" ] && [ -n "$oi" ] && [ "$li" = "$oi" ]; then
+          echo "old"
+          return 0
+        fi
+      done
+      for ni in "${_new_ips[@]}" ::1; do
+        if [ -n "$li" ] && [ -n "$ni" ] && [ "$li" = "$ni" ]; then
+          echo "new"
+          return 0
+        fi
+      done
+    done
+  fi
+  echo "${guess}"
+}
+
+prompt_origin_mode() {
+  local default_choice="n"
+  local guess
+  guess="$(detect_run_from)"
+  case "${guess}" in
+    old) default_choice="s" ;;
+    new) default_choice="t" ;;
+  esac
+  require_tty_for_prompt "ORIGIN_MODE"
+  while true; do
+    local choice
+    read -rp "Run context - [s]ource (OLD), [t]arget (NEW), [n]either [${default_choice}]: " choice
+    choice="${choice:-${default_choice}}"
+    case "${choice}" in
+      [Ss]) ORIGIN_MODE="old"; break ;;
+      [Tt]) ORIGIN_MODE="new"; break ;;
+      [Nn]) ORIGIN_MODE="other"; break ;;
+      *) WARN "Invalid choice '${choice}'. Enter s, t, or n." ;;
+    esac
+  done
+}
+
+resolve_run_from() {
+  case "${ORIGIN_MODE}" in
+    old|source) RUN_FROM="old" ;;
+    new|target) RUN_FROM="new" ;;
+    other|neither) RUN_FROM="other" ;;
+    auto) RUN_FROM="$(detect_run_from)" ;;
+    *) RUN_FROM="other" ;;
+  esac
+}
+
+local_host_name() {
+  hostname -f 2>/dev/null || hostname
+}
+
+set_local_identity() {
+  local prefix="$1" default_host="$2"
+  local host_var="${prefix}_HOST"
+  local user_var="${prefix}_USER"
+  local port_var="${prefix}_SSH_PORT"
+  local host_val="${!host_var:-}"
+  local user_val="${!user_var:-}"
+  local local_host
+  local local_user
+  local_host="$(local_host_name)"
+  local_user="$(id -un)"
+
+  if [ -z "${host_val}" ] || [ "${host_val}" = "${default_host}" ]; then
+    printf -v "${host_var}" '%s' "${local_host}"
+  fi
+  if [ -z "${user_val}" ] || [ "${user_val}" = "${DEFAULT_SSH_USER}" ]; then
+    printf -v "${user_var}" '%s' "${local_user}"
+  fi
+  if [ -z "${!port_var:-}" ]; then
+    printf -v "${port_var}" '%s' "22"
+  fi
+}
+
 describe_ssh_auth() {
   local prefix="$1"
+  if { [ "${prefix}" = "OLD" ] && [ "${RUN_FROM}" = "old" ]; } \
+    || { [ "${prefix}" = "NEW" ] && [ "${RUN_FROM}" = "new" ]; }; then
+    echo "local"
+    return
+  fi
   local key_var="${prefix}_SSH_KEY_PATH"
   local pass_var="${prefix}_SSH_PASSWORD"
   if [ -n "${!pass_var:-}" ]; then
@@ -506,14 +603,28 @@ describe_ssh_auth() {
   fi
 }
 
+# ---------- run context ----------
+if [ -t 0 ] && [ "${ORIGIN_MODE}" = "auto" ]; then
+  prompt_origin_mode
+fi
+resolve_run_from
+
 # ---------- gather config ----------
 if [ -t 0 ]; then
-  prompt_var OLD_HOST "Source host (OLD_HOST)"
-  prompt_var OLD_USER "Source SSH user (OLD_USER)"
-  prompt_var OLD_SSH_PORT "Source SSH port (OLD_SSH_PORT)"
-  prompt_var NEW_HOST "Destination host (NEW_HOST)"
-  prompt_var NEW_USER "Destination SSH user (NEW_USER)"
-  prompt_var NEW_SSH_PORT "Destination SSH port (NEW_SSH_PORT)"
+  if [ "${RUN_FROM}" = "old" ]; then
+    set_local_identity "OLD" "${OLD_HOST_DEFAULT}"
+  else
+    prompt_var OLD_HOST "Source host (OLD_HOST)"
+    prompt_var OLD_USER "Source SSH user (OLD_USER)"
+    prompt_var OLD_SSH_PORT "Source SSH port (OLD_SSH_PORT)"
+  fi
+  if [ "${RUN_FROM}" = "new" ]; then
+    set_local_identity "NEW" "${NEW_HOST_DEFAULT}"
+  else
+    prompt_var NEW_HOST "Destination host (NEW_HOST)"
+    prompt_var NEW_USER "Destination SSH user (NEW_USER)"
+    prompt_var NEW_SSH_PORT "Destination SSH port (NEW_SSH_PORT)"
+  fi
   prompt_var OLD_WEB_ROOT "Source web root absolute path (OLD_WEB_ROOT)"
   prompt_var PLESK_DOMAIN "Plesk domain name (PLESK_DOMAIN)"
   prompt_var PLESK_IP_ADDR "IPv4 address for subscription (PLESK_IP_ADDR)"
@@ -563,34 +674,59 @@ pv_or_cat() { if command -v pv >/dev/null 2>&1; then echo "pv -brat"; else echo 
 SSH_CTL_DIR="${HOME}/.ssh/ctl-mux"
 mkdir -p "${SSH_CTL_DIR}"; chmod 700 "${SSH_CTL_DIR}"
 
-# Detect whether we're running on the OLD host
-RUN_FROM="other"
-if [ "${ORIGIN_MODE}" = "old" ]; then
-  RUN_FROM="old"
-else
-  # auto-detect: compare OLD_HOST addresses with local addresses
-  if command -v ip >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
-    mapfile -t _local_ips < <(ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
-    mapfile -t _old_ips < <(getent ahosts "${OLD_HOST}" | awk '{print $1}' | sort -u)
-    for li in "${_local_ips[@]}" 127.0.0.1; do
-      for oi in "${_old_ips[@]}" ::1; do
-        if [ -n "$li" ] && [ -n "$oi" ] && [ "$li" = "$oi" ]; then RUN_FROM="old"; break 2; fi
-      done
-    done
+has_lz4_on_old() {
+  if [ "${RUN_FROM}" = "old" ]; then
+    command -v lz4 >/dev/null 2>&1
+  else
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" command -v lz4 >/dev/null 2>&1
   fi
-fi
+}
 
-# If still unknown and interactive, ask the user
-if [ "${RUN_FROM}" != "old" ] && [ "${ORIGIN_MODE}" = "auto" ] && [ -t 0 ]; then
-  read -rp "Are you running this script on the OLD source server? [Y/n]: " _yn
-  _yn=${_yn:-y}
-  if [[ "${_yn}" =~ ^[Yy]$ ]]; then RUN_FROM="old"; fi
-fi
+has_lz4_on_new() {
+  if [ "${RUN_FROM}" = "new" ]; then
+    command -v lz4 >/dev/null 2>&1
+  else
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1
+  fi
+}
+
+has_gzip_on_old() {
+  if [ "${RUN_FROM}" = "old" ]; then
+    command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1
+  else
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+      bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1'
+  fi
+}
+
+has_gzip_on_new() {
+  if [ "${RUN_FROM}" = "new" ]; then
+    command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1
+  else
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1'
+  fi
+}
 
 # ---------- transfer helpers ----------
 rsync_direct_pull_from_old_to_new_code() {
   # Runs rsync ON NEW host, pulling code (excludes assets) from OLD into NEW_WEB_ROOT
   INFO "Running direct rsync on NEW pulling code from OLD (excludes assets)."
+  if [ "${RUN_FROM}" = "new" ]; then
+    if ! command -v rsync >/dev/null 2>&1; then
+      ERR "rsync missing on NEW host (local)."
+      exit 1
+    fi
+    EXCLUDES=()
+    for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
+    EXCLUDES+=(--exclude="${ASSETS_DIR}")
+    rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+      "${EXCLUDES[@]}" \
+      "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/" \
+      "${NEW_WEB_ROOT%/}/"
+    return
+  fi
   # Pre-escape password for remote if provided
   local pass_esc=""
   if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
@@ -631,6 +767,18 @@ REMOTE
 
 rsync_direct_pull_from_old_to_new_assets() {
   INFO "Running direct rsync on NEW pulling assets from OLD."
+  if [ "${RUN_FROM}" = "new" ]; then
+    if ! command -v rsync >/dev/null 2>&1; then
+      ERR "rsync missing on NEW host (local)."
+      exit 1
+    fi
+    mkdir -p "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}"
+    rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+      -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
+      "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}/" \
+      "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+    return
+  fi
   local pass_esc=""
   if [ -n "${OLD_SSH_PASSWORD:-}" ]; then
       pass_esc=$(printf "%s" "${OLD_SSH_PASSWORD}" | sed -e "s/'/'\\''/g")
@@ -704,6 +852,22 @@ tar_stream_copy() {
 set -euo pipefail
 mkdir -p "$DEST"
 tar -C "$DEST" -xpf -
+REMOTE2
+  elif [ "${RUN_FROM}" = "new" ]; then
+    # Remote tar on OLD → local extract on NEW
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<REMOTE | \
+  ${PV} | \
+  bash -s <<REMOTE2
+set -euo pipefail
+SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
+declare -a exargs=()
+for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
+tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+REMOTE
+set -euo pipefail
+DEST="${dest_dir%/}"
+mkdir -p "\$DEST"
+tar -C "\$DEST" -xpf -
 REMOTE2
   else
     # Remote tar on OLD → ssh NEW
@@ -797,7 +961,12 @@ if [ -n "${LOG_FILE}" ]; then
 else
   INFO "Structured log -> disabled (set LOG_FILE env var to enable)"
 fi
-INFO "Run context: $( [ "${RUN_FROM}" = "old" ] && echo 'running on OLD' || echo 'running elsewhere' )"
+case "${RUN_FROM}" in
+  old) run_ctx="running on OLD (source)" ;;
+  new) run_ctx="running on NEW (target)" ;;
+  *) run_ctx="running on neither host" ;;
+esac
+INFO "Run context: ${run_ctx}"
 LINE
 
 # Resolve effective rsync user for NEW
@@ -813,7 +982,7 @@ if [ "${DRY_RUN}" = "true" ]; then RSYNC_DRY="--dry-run"; fi
 
 STEP "Open SSH sessions (prompts occur here)"
 [ "${RUN_FROM}" = "old" ] || open_master "old" "${OLD_USER}" "${OLD_HOST}" "${OLD_SSH_PORT}"
-open_master "new" "${NEW_USER}" "${NEW_HOST}" "${NEW_SSH_PORT}"
+[ "${RUN_FROM}" = "new" ] || open_master "new" "${NEW_USER}" "${NEW_HOST}" "${NEW_SSH_PORT}"
 
 STEP "Validate required commands on OLD host"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
@@ -880,6 +1049,30 @@ fi
 STEP "Validate required commands on NEW host"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
+elif [ "${RUN_FROM}" = "new" ]; then
+  need_install=()
+  if ! command -v rsync >/dev/null 2>&1; then need_install+=(rsync); fi
+  if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysql >/dev/null 2>&1; then need_install+=(default-mysql-client); fi
+  if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ]; then
+    if ! command -v sshpass >/dev/null 2>&1; then need_install+=(sshpass); fi
+  fi
+  if [ "${#need_install[@]}" -gt 0 ] && [ "$(id -u)" = "0" ] && command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y || apt-get update || true
+    apt-get install -y "${need_install[@]}" || true
+  fi
+  missing=()
+  command -v rsync >/dev/null 2>&1 || missing+=(rsync)
+  if [ "${SKIP_DB:-false}" != "true" ] && ! command -v mysql >/dev/null 2>&1; then missing+=(mysql-client); fi
+  if [ -n "${OLD_SSH_PASSWORD:-}" ] && [ "${TRANSFER_MODE:-}" = "direct" ] && ! command -v sshpass >/dev/null 2>&1; then missing+=(sshpass); fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    ERR "Missing required commands on NEW (local): ${missing[*]}"
+    if [ "$(id -u)" != "0" ]; then
+      WARN "Tip: run as root on Debian/Ubuntu to auto-install."
+    fi
+    exit 1
+  fi
+  INFO "NEW host dependencies satisfied (local)."
 else
   ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
   OLD_SSH_PASSWORD="${OLD_SSH_PASSWORD:-}" TRANSFER_MODE="${TRANSFER_MODE}" SKIP_DB="${SKIP_DB}" 'bash -s' <<'REMOTE'
@@ -929,32 +1122,45 @@ echo "OLD MySQL connectivity OK."
 REMOTE
 fi
 if [ "${SKIP_DB}" != "true" ]; then
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-  NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" 'bash -s' <<'REMOTE'
+  if [ "${RUN_FROM}" = "new" ]; then
+    export MYSQL_PWD="${NEW_DB_PASS}"
+    mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" -e "SELECT VERSION() AS new_version;" >/dev/null
+    INFO "NEW MySQL connectivity OK."
+  else
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" 'bash -s' <<'REMOTE'
 set -euo pipefail
 export MYSQL_PWD="${NEW_DB_PASS}"
 mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" -e "SELECT VERSION() AS new_version;" >/dev/null
 echo "NEW MySQL connectivity OK."
 REMOTE
+  fi
 fi
 
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   STEP "Ensure Plesk subscription and DB records"
   if [ "${START_STEP:-1}" -le "${STEP_N}" ]; then
   DB_LIST_CSV="$(IFS=$' '; echo "${DB_LIST[*]}")"
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    PLESK_DOMAIN="${PLESK_DOMAIN}" \
-    PLESK_OWNER="${PLESK_OWNER}" \
-    PLESK_SERVICE_PLAN="${PLESK_SERVICE_PLAN}" \
-    PLESK_IP_ADDR="${PLESK_IP_ADDR}" \
-    PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" \
-    PLESK_SYSTEM_PASS="${PLESK_SYSTEM_PASS}" \
-    PLESK_DOCROOT_REL="${PLESK_DOCROOT_REL}" \
-    PLESK_DB_SERVER="${PLESK_DB_SERVER}" \
-    PLESK_DB_TYPE="${PLESK_DB_TYPE}" \
-    NEW_DB_USER="${NEW_DB_USER}" \
-    NEW_DB_PASS="${NEW_DB_PASS}" \
-    DB_LIST_CSV="${DB_LIST_CSV}" 'bash -s' <<'REMOTE'
+  NEW_ENV=(
+    PLESK_DOMAIN="${PLESK_DOMAIN}"
+    PLESK_OWNER="${PLESK_OWNER}"
+    PLESK_SERVICE_PLAN="${PLESK_SERVICE_PLAN}"
+    PLESK_IP_ADDR="${PLESK_IP_ADDR}"
+    PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}"
+    PLESK_SYSTEM_PASS="${PLESK_SYSTEM_PASS}"
+    PLESK_DOCROOT_REL="${PLESK_DOCROOT_REL}"
+    PLESK_DB_SERVER="${PLESK_DB_SERVER}"
+    PLESK_DB_TYPE="${PLESK_DB_TYPE}"
+    NEW_DB_USER="${NEW_DB_USER}"
+    NEW_DB_PASS="${NEW_DB_PASS}"
+    DB_LIST_CSV="${DB_LIST_CSV}"
+  )
+  if [ "${RUN_FROM}" = "new" ]; then
+    NEW_CMD=(env "${NEW_ENV[@]}" bash -s)
+  else
+    NEW_CMD=(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "${NEW_ENV[@]}" bash -s)
+  fi
+  "${NEW_CMD[@]}" <<'REMOTE'
 set -euo pipefail
 log() { echo "[$(date +%F\ %T)] $*"; }
 if ! command -v plesk >/dev/null 2>&1; then
@@ -1005,9 +1211,13 @@ else
       ERR "NEW_WEB_ROOT is empty and --plesk-setup was not used. Set NEW_WEB_ROOT manually."
       exit 1
     fi
-    local_default_root="$(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      PLESK_DOMAIN="${PLESK_DOMAIN}" \
-      PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" 'bash -s' <<'REMOTE'
+    if [ "${RUN_FROM}" = "new" ]; then
+      NEW_CMD=(env PLESK_DOMAIN="${PLESK_DOMAIN}" PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" bash -s)
+    else
+      NEW_CMD=(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+        PLESK_DOMAIN="${PLESK_DOMAIN}" PLESK_VHOSTS_ROOT="${PLESK_VHOSTS_ROOT}" bash -s)
+    fi
+    local_default_root="$("${NEW_CMD[@]}" <<'REMOTE'
 set -euo pipefail
 if ! command -v plesk >/dev/null 2>&1; then
   echo "" && exit 0
@@ -1072,8 +1282,14 @@ STEP "Preflight on NEW"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
+  if [ "${RUN_FROM}" = "new" ]; then
+    mkdir -p "${NEW_WEB_ROOT}" "${NEW_WEB_ROOT}/${ASSETS_DIR}"
+    ls -ld "${NEW_WEB_ROOT}" "${NEW_WEB_ROOT}/${ASSETS_DIR}"
+    df -h "${NEW_WEB_ROOT}" 2>/dev/null || df -h / || true
+  else
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mkdir -p '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}' && ls -ld '${NEW_WEB_ROOT}' '${NEW_WEB_ROOT}/${ASSETS_DIR}'"
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "df -h '${NEW_WEB_ROOT}' 2>/dev/null || df -h /" || true
+  fi
 fi
 
 if [ "${TRANSFER_MODE}" = "stage" ]; then
@@ -1109,10 +1325,16 @@ else
         INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
       else
       START=$(tic)
-      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-        -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-        "${STAGE_DIR}/code/" \
-        "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"
+      if [ "${RUN_FROM}" = "new" ]; then
+        rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+          "${STAGE_DIR}/code/" \
+          "${NEW_WEB_ROOT%/}/"
+      else
+        rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+          -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+          "${STAGE_DIR}/code/" \
+          "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"
+      fi
       INFO "Code pushed in $(toc "$START")"
       fi
       fi
@@ -1173,10 +1395,16 @@ else
         INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
       else
       START=$(tic)
-      rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
-        -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
-        "${STAGE_DIR}/assets/" \
-        "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+      if [ "${RUN_FROM}" = "new" ]; then
+        rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+          "${STAGE_DIR}/assets/" \
+          "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+      else
+        rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+          -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
+          "${STAGE_DIR}/assets/" \
+          "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+      fi
       INFO "Assets pushed in $(toc "$START")"
       fi
       fi
@@ -1216,8 +1444,13 @@ STEP "Fix ownership and permissions on NEW (Plesk)"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
-ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-  NEW_WEB_ROOT="${NEW_WEB_ROOT}" PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" 'bash -s' <<'REMOTE'
+  if [ "${RUN_FROM}" = "new" ]; then
+    NEW_CMD=(env NEW_WEB_ROOT="${NEW_WEB_ROOT}" PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" bash -s)
+  else
+    NEW_CMD=(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      NEW_WEB_ROOT="${NEW_WEB_ROOT}" PLESK_SYSTEM_USER="${PLESK_SYSTEM_USER}" bash -s)
+  fi
+  "${NEW_CMD[@]}" <<'REMOTE'
 set -euo pipefail
 ts() { date +%F\ %T; }
 if [ "$(id -u)" != "0" ]; then
@@ -1257,9 +1490,14 @@ if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
 for db in "${DB_LIST[@]}"; do
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
-     -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
+  if [ "${RUN_FROM}" = "new" ]; then
+    MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
+      -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  else
+    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
+       -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
+  fi
 done
 INFO "DBs ensured."
 fi
@@ -1270,9 +1508,14 @@ if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
 else
   for db in "${DB_LIST[@]}"; do
     # Ensure target DB exists even when resuming at this step
-    ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
-       -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" || true
+    if [ "${RUN_FROM}" = "new" ]; then
+      MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
+        -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || true
+    else
+      ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+        "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
+         -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" || true
+    fi
     # Build ignore-table list for this DB
     TABLES_TO_IGNORE=""
     if [ ${#DB_EXCLUDE_TABLES[@]} -gt 0 ]; then
@@ -1289,15 +1532,9 @@ else
     COMP_CHOICE=none
     # Detect compression pair
     if [ "${DB_COMPRESS}" = "auto" ]; then
-      if { [ "${RUN_FROM}" = "old" ] && command -v lz4 >/dev/null 2>&1; } \
-         && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1 \
-         || { [ "${RUN_FROM}" != "old" ] && ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" command -v lz4 >/dev/null 2>&1 \
-              && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" command -v lz4 >/dev/null 2>&1; }; then
+      if has_lz4_on_old && has_lz4_on_new; then
         COMP_CHOICE=lz4
-      elif { [ "${RUN_FROM}" = "old" ] && (command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1); } \
-           && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1' \
-           || { [ "${RUN_FROM}" != "old" ] && ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1' \
-                && ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" bash -lc 'command -v pigz >/dev/null 2>&1 || command -v gzip >/dev/null 2>&1'; }; then
+      elif has_gzip_on_old && has_gzip_on_new; then
         COMP_CHOICE=gzip
       else
         COMP_CHOICE=none
@@ -1343,7 +1580,11 @@ else
         gzip) comp_ext="sql.gz"; comp_send="gzip -1"; comp_decomp="zcat" ;;
         none) comp_ext="sql"; comp_send="cat"; comp_decomp="cat" ;;
       esac
-      TMPFILE="$(ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mktemp /tmp/${DBNAME}.XXXX.${comp_ext}")"
+      if [ "${RUN_FROM}" = "new" ]; then
+        TMPFILE="$(mktemp "/tmp/${DBNAME}.XXXX.${comp_ext}")"
+      else
+        TMPFILE="$(ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mktemp /tmp/${DBNAME}.XXXX.${comp_ext}")"
+      fi
       INFO "Uploading dump to NEW: ${TMPFILE}"
       IGNORE_ARGS_STR=""
       for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
@@ -1358,6 +1599,21 @@ else
           | ${comp_send} \
           | ${PV} \
           | ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "cat > '${TMPFILE}'"
+      elif [ "${RUN_FROM}" = "new" ]; then
+        ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
+          OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
+          DBNAME="${DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_SEND="${comp_send}" 'bash -s' <<'REMOTE_OLD_BUF' \
+          | ${PV} \
+          | cat > "${TMPFILE}"
+set -euo pipefail
+export MYSQL_PWD="${OLD_DB_PASS}"
+if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+IGNORE_ARGS_STR=""
+for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
+eval "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" \
+  --single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 \
+  ${IGNORE_ARGS_STR} "${DBNAME}" | ${COMP_SEND}
+REMOTE_OLD_BUF
       else
         ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
           OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
@@ -1375,15 +1631,22 @@ eval "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" \
 REMOTE_OLD_BUF
       fi
       INFO "Importing ${TMPFILE} on NEW"
-      ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-        NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
-        TMPFILE="${TMPFILE}" comp_decomp="${comp_decomp}" DBNAME="${DBNAME}" 'bash -s' <<'REMOTE_IMP'
+      if [ "${RUN_FROM}" = "new" ]; then
+        export MYSQL_PWD="${NEW_DB_PASS}"
+        { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; ${comp_decomp} "${TMPFILE}"; } \
+          | mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
+        rm -f "${TMPFILE}"
+      else
+        ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+          NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
+          TMPFILE="${TMPFILE}" comp_decomp="${comp_decomp}" DBNAME="${DBNAME}" 'bash -s' <<'REMOTE_IMP'
 set -euo pipefail
 export MYSQL_PWD="${NEW_DB_PASS}"
 { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; ${comp_decomp} "${TMPFILE}"; } \
   | mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
 rm -f "${TMPFILE}"
 REMOTE_IMP
+      fi
     }
 
     # Dump -> compress -> import: choose mode
@@ -1427,9 +1690,22 @@ REMOTE_OLD
           none) cat ;; \
         esac
       } \
-    | ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-        NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
-        COMP_CHOICE="${COMP_CHOICE}" DBNAME="${db}" 'bash -s' <<'REMOTE_NEW'
+    | {
+        if [ "${RUN_FROM}" = "new" ]; then
+          set -euo pipefail
+          export MYSQL_PWD="${NEW_DB_PASS}"
+          if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
+          case "${COMP_CHOICE}" in
+            lz4)  IN="lz4 -d" ;;
+            gzip) IN="gzip -d" ;;
+            none) IN="cat" ;;
+          esac
+          { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; eval $IN; } \
+            | eval $WRAP mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${db}"
+        else
+          ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+            NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
+            COMP_CHOICE="${COMP_CHOICE}" DBNAME="${db}" bash -s <<'REMOTE_NEW'
 set -euo pipefail
 set -o pipefail
 export MYSQL_PWD="${NEW_DB_PASS}"
@@ -1442,6 +1718,8 @@ esac
 { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; eval $IN; } \
   | eval $WRAP mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
 REMOTE_NEW
+        fi
+      }
     else
       # Auto or unknown: robust default to buffered mode
       db_import_buffer "${db}"
@@ -1465,8 +1743,13 @@ if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 elif [ "${MODE}" = "wordpress" ]; then
   # Check for wp-config.php; DB constants update intentionally skipped to avoid quoting issues on diverse configs
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    NEW_WEB_ROOT="${NEW_WEB_ROOT}" 'bash -s' <<'REMOTE'
+  if [ "${RUN_FROM}" = "new" ]; then
+    NEW_CMD=(env NEW_WEB_ROOT="${NEW_WEB_ROOT}" bash -s)
+  else
+    NEW_CMD=(ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+      NEW_WEB_ROOT="${NEW_WEB_ROOT}" bash -s)
+  fi
+  "${NEW_CMD[@]}" <<'REMOTE'
 set -euo pipefail
 CONF="${NEW_WEB_ROOT%/}/wp-config.php"
 if [ -f "$CONF" ]; then
