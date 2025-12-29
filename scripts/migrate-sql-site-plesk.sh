@@ -70,6 +70,8 @@ save_config() {
     echo "DB_COMPRESS='$( _sh_escape "${DB_COMPRESS:-}")'"
     echo "MODE='$( _sh_escape "${MODE:-}")'"
     echo "MAINTENANCE='$( _sh_escape "${MAINTENANCE:-}")'"
+    echo "ALLOW_LEGACY_SSH='$( _sh_escape "${ALLOW_LEGACY_SSH:-}")'"
+    echo "LEGACY_SSH_HOSTKEYS='$( _sh_escape "${LEGACY_SSH_HOSTKEYS:-}")'"
     # DB list as a single string
     echo "DB_LIST='$( _sh_escape "${DB_LIST[*]:-}")'"
   } >"${tmp}"
@@ -88,6 +90,9 @@ DB_MODE="${DB_MODE:-buffer}"         # buffer|stream|auto (default: buffer for r
 MAINTENANCE="${MAINTENANCE:-prompt}" # prompt|true|false
 WPCLI_ENSURE="${WPCLI_ENSURE:-true}" # ensure wp-cli availability on NEW when mode=wordpress
 WP_SEARCH_REPLACE="${WP_SEARCH_REPLACE:-auto}" # auto|true|false
+# Allow legacy SSH host key algorithms (e.g., ssh-rsa) for old servers
+ALLOW_LEGACY_SSH="${ALLOW_LEGACY_SSH:-false}"
+LEGACY_SSH_HOSTKEYS="${LEGACY_SSH_HOSTKEYS:-+ssh-rsa}"
 # Where this script is running from: auto|old|new|other
 ORIGIN_MODE="${ORIGIN_MODE:-auto}"
 # Transfer strategy: direct (default), stage (local staging), stream (tar over SSH; no delete)
@@ -145,6 +150,8 @@ Common options:
                                 stream = tar over SSH via local, no delete.
   --from-old                    Force run-from-OLD mode (script is running on the OLD server).
   --from-new                    Force run-from-NEW mode (script is running on the NEW server).
+  --allow-legacy-ssh            Allow legacy SSH host key algorithms (e.g., ssh-rsa) for OLD/NEW.
+  --legacy-hostkeys <list>      Override legacy host key list (default: +ssh-rsa).
   --start-step <N>              Start at STEP number N (skips earlier steps). See logs for step numbers.
   --exclude-table <db.tbl|tbl>  Repeatable. Exclude table(s) from dump (prefix with DB or omit to apply per-DB).
   --old-user <user>             SSH username for OLD host (overrides OLD_USER).
@@ -180,6 +187,8 @@ while [[ $# -gt 0 ]]; do
     --transfer-mode) TRANSFER_MODE="$2"; shift 2 ;;
     --from-old) ORIGIN_MODE="old"; shift ;;
     --from-new) ORIGIN_MODE="new"; shift ;;
+    --allow-legacy-ssh) ALLOW_LEGACY_SSH=true; shift ;;
+    --legacy-hostkeys) LEGACY_SSH_HOSTKEYS="$2"; shift 2 ;;
     --start-step) START_STEP="$2"; shift 2 ;;
     --exclude-table)
       DB_EXCLUDE_TABLES+=("$2"); shift 2 ;;
@@ -425,6 +434,19 @@ prompt_db_list_if_default() {
   done
 }
 
+parse_db_spec() {
+  local spec="$1"
+  DB_SRC_NAME="${spec%%:*}"
+  DB_DST_NAME="${spec#*:}"
+  if [[ "${spec}" != *:* ]]; then
+    DB_DST_NAME="${DB_SRC_NAME}"
+  fi
+  if [ -z "${DB_SRC_NAME}" ] || [ -z "${DB_DST_NAME}" ]; then
+    ERR "Invalid DB entry '${spec}'. Use name or old:new."
+    exit 1
+  fi
+}
+
 confirm_db_migration_needed() {
   # Interactive guard to avoid prompting for DB details when not needed
   if [ "${SKIP_DB}" = "true" ]; then
@@ -638,7 +660,7 @@ if [ -t 0 ]; then
     prompt_var NEW_DB_HOST "Destination MySQL host (NEW_DB_HOST)"
     prompt_var NEW_DB_USER "Destination MySQL user (NEW_DB_USER)"
     prompt_secret NEW_DB_PASS "Destination MySQL password (NEW_DB_PASS)"
-    prompt_db_list "Databases to migrate (space-separated)"
+    prompt_db_list "Databases to migrate (space-separated; use old:new to rename on NEW)"
   else
     DB_LIST=()
   fi
@@ -708,6 +730,36 @@ has_gzip_on_new() {
   fi
 }
 
+ensure_new_db() {
+  local db_name="$1"
+  if [ "${RUN_FROM}" = "new" ]; then
+    if MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
+      -e "USE \`${db_name}\`;" >/dev/null 2>&1; then
+      INFO "DB ${db_name} already accessible on NEW."
+      return 0
+    fi
+    if MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
+      -e "CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+      return 0
+    fi
+    ERR "Failed to create or access NEW database '${db_name}'. Ensure it exists and '${NEW_DB_USER}' has access."
+    return 1
+  fi
+
+  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
+    NEW_DB_NAME="${db_name}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" NEW_DB_PASS="${NEW_DB_PASS}" \
+    'bash -s' <<'REMOTE'
+set -euo pipefail
+export MYSQL_PWD="${NEW_DB_PASS}"
+if mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" -e "USE \`${NEW_DB_NAME}\`;" >/dev/null 2>&1; then
+  echo "DB ${NEW_DB_NAME} already accessible on NEW."
+  exit 0
+fi
+mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
+  -e "CREATE DATABASE IF NOT EXISTS \`${NEW_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+REMOTE
+}
+
 # ---------- transfer helpers ----------
 rsync_direct_pull_from_old_to_new_code() {
   # Runs rsync ON NEW host, pulling code (excludes assets) from OLD into NEW_WEB_ROOT
@@ -720,11 +772,18 @@ rsync_direct_pull_from_old_to_new_code() {
     EXCLUDES=()
     for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
     EXCLUDES+=(--exclude="${ASSETS_DIR}")
-    rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+    if ! rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
       -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
       "${EXCLUDES[@]}" \
       "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/" \
-      "${NEW_WEB_ROOT%/}/"
+      "${NEW_WEB_ROOT%/}/"; then
+      rc=$?
+      if [ "${rc}" -eq 24 ]; then
+        WARN "rsync reported vanished files (code 24); continuing."
+      else
+        return "${rc}"
+      fi
+    fi
     return
   fi
   # Pre-escape password for remote if provided
@@ -756,12 +815,19 @@ if [ -n "${PASS_ESC}" ]; then
     exit 1
   fi
 fi
-eval ${SSHPASS_PRE} rsync -azh \
+if ! eval ${SSHPASS_PRE} rsync -azh \
   ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
   -e "ssh -p ${OLD_SSH_PORT}" \
   "\${EXCLUDES[@]}" \
   "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/" \
-  "${NEW_WEB_ROOT}/"
+  "${NEW_WEB_ROOT}/"; then
+  rc=$?
+  if [ "\${rc}" -eq 24 ]; then
+    echo "rsync reported vanished files (code 24); continuing." >&2
+    exit 0
+  fi
+  exit "\${rc}"
+fi
 REMOTE
 }
 
@@ -773,10 +839,17 @@ rsync_direct_pull_from_old_to_new_assets() {
       exit 1
     fi
     mkdir -p "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}"
-    rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+    if ! rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
       -e "ssh -S ${SSH_CTL_DIR}/old -p ${OLD_SSH_PORT}" \
       "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}/" \
-      "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+      "${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"; then
+      rc=$?
+      if [ "${rc}" -eq 24 ]; then
+        WARN "rsync reported vanished files (code 24); continuing."
+      else
+        return "${rc}"
+      fi
+    fi
     return
   fi
   local pass_esc=""
@@ -802,11 +875,18 @@ if [ -n "${PASS_ESC}" ]; then
   fi
 fi
 mkdir -p "${NEW_WEB_ROOT}/${ASSETS_DIR}"
-eval ${SSHPASS_PRE} rsync -azh \
+if ! eval ${SSHPASS_PRE} rsync -azh \
   ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
   -e "ssh -p ${OLD_SSH_PORT}" \
   "${OLD_USER}@${OLD_HOST}:${OLD_WEB_ROOT}/${ASSETS_DIR}/" \
-  "${NEW_WEB_ROOT}/${ASSETS_DIR}/"
+  "${NEW_WEB_ROOT}/${ASSETS_DIR}/"; then
+  rc=$?
+  if [ "\${rc}" -eq 24 ]; then
+    echo "rsync reported vanished files (code 24); continuing." >&2
+    exit 0
+  fi
+  exit "\${rc}"
+fi
 REMOTE
 }
 
@@ -816,19 +896,33 @@ rsync_push_code_from_old_to_new() {
   EXCLUDES=()
   for x in ${RSYNC_EXCLUDES}; do EXCLUDES+=(--exclude="$x"); done
   EXCLUDES+=(--exclude="${ASSETS_DIR}")
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+  if ! rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
     "${EXCLUDES[@]}" \
     -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
     "${OLD_WEB_ROOT%/}/" \
-    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"
+    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/"; then
+    rc=$?
+    if [ "${rc}" -eq 24 ]; then
+      WARN "rsync reported vanished files (code 24); continuing."
+      return 0
+    fi
+    return "${rc}"
+  fi
 }
 
 rsync_push_assets_from_old_to_new() {
   INFO "Pushing assets from OLD to NEW via rsync (delete)."
-  rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
+  if ! rsync -azh ${RSYNC_DRY} --delete --stats --info=progress2 --human-readable \
     -e "ssh -S ${SSH_CTL_DIR}/new -p ${NEW_SSH_PORT}" \
     "${OLD_WEB_ROOT%/}/${ASSETS_DIR%/}/" \
-    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"
+    "${RSYNC_USER_NEW_EFFECTIVE}@${NEW_HOST}:${NEW_WEB_ROOT%/}/${ASSETS_DIR%/}/"; then
+    rc=$?
+    if [ "${rc}" -eq 24 ]; then
+      WARN "rsync reported vanished files (code 24); continuing."
+      return 0
+    fi
+    return "${rc}"
+  fi
 }
 
 tar_stream_copy() {
@@ -862,7 +956,11 @@ set -euo pipefail
 SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
 declare -a exargs=()
 for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
-tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+if [ "\${#exargs[@]}" -gt 0 ]; then
+  tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+else
+  tar -C "\$SRC" -cpf - .
+fi
 REMOTE
 set -euo pipefail
 DEST="${dest_dir%/}"
@@ -878,7 +976,11 @@ set -euo pipefail
 SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
 declare -a exargs=()
 for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
-tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+if [ "\${#exargs[@]}" -gt 0 ]; then
+  tar -C "\$SRC" -cpf - "\${exargs[@]}" .
+else
+  tar -C "\$SRC" -cpf - .
+fi
 REMOTE
 set -euo pipefail
 DEST="${dest_dir%/}"
@@ -895,29 +997,51 @@ open_master() { # name user host port
   local pass_var="${prefix}_SSH_PASSWORD"
   local identity="${!key_var:-}"
   local password="${!pass_var:-}"
+  local use_legacy="${ALLOW_LEGACY_SSH}"
 
   INFO "Opening SSH master to ${user}@${host}:${port} (you may be prompted)."
-  local ssh_base=(ssh -fN
-    -o ControlMaster=auto
-    -o ControlPersist=600
-    -o StrictHostKeyChecking=accept-new
-    -S "${SSH_CTL_DIR}/${name}"
-    -p "${port}")
-  # When doing direct rsync from NEW -> OLD, enable agent forwarding to NEW
-  if [ "${name}" = "new" ] && [ "${TRANSFER_MODE}" = "direct" ]; then
-    ssh_base+=(-A -o ForwardAgent=yes)
-  fi
-  if [ -n "${identity}" ]; then
-    ssh_base+=(-i "${identity}")
-  fi
-  if [ -n "${password}" ] && command -v sshpass >/dev/null 2>&1; then
-    sshpass -p "${password}" "${ssh_base[@]}" "${user}@${host}" || { ERR "SSH master failed for ${host}"; exit 1; }
-  else
-    if [ -n "${password}" ] && ! command -v sshpass >/dev/null 2>&1; then
-      WARN "sshpass not found; ${prefix} host will prompt for password interactively."
+  while true; do
+    local ssh_base=(ssh -fN
+      -o ControlMaster=auto
+      -o ControlPersist=600
+      -o StrictHostKeyChecking=accept-new
+      -S "${SSH_CTL_DIR}/${name}"
+      -p "${port}")
+    # When doing direct rsync from NEW -> OLD, enable agent forwarding to NEW
+    if [ "${name}" = "new" ] && [ "${TRANSFER_MODE}" = "direct" ]; then
+      ssh_base+=(-A -o ForwardAgent=yes)
     fi
-    "${ssh_base[@]}" "${user}@${host}" || { ERR "SSH master failed for ${host}"; exit 1; }
-  fi
+    if [ "${use_legacy}" = "true" ]; then
+      ssh_base+=(-o HostKeyAlgorithms="${LEGACY_SSH_HOSTKEYS}" -o PubkeyAcceptedAlgorithms="${LEGACY_SSH_HOSTKEYS}")
+    fi
+    if [ -n "${identity}" ]; then
+      ssh_base+=(-i "${identity}")
+    fi
+    if [ -n "${password}" ] && command -v sshpass >/dev/null 2>&1; then
+      if sshpass -p "${password}" "${ssh_base[@]}" "${user}@${host}"; then
+        break
+      fi
+    else
+      if [ -n "${password}" ] && ! command -v sshpass >/dev/null 2>&1; then
+        WARN "sshpass not found; ${prefix} host will prompt for password interactively."
+      fi
+      if "${ssh_base[@]}" "${user}@${host}"; then
+        break
+      fi
+    fi
+
+    if [ "${use_legacy}" != "true" ] && [ -t 0 ]; then
+      local ans
+      read -rp "SSH failed for ${host}. Retry with legacy host key algorithms? [y/N]: " ans
+      if [[ "${ans}" =~ ^[Yy]$ ]]; then
+        use_legacy="true"
+        WARN "Retrying with legacy host keys (${LEGACY_SSH_HOSTKEYS})."
+        continue
+      fi
+    fi
+    ERR "SSH master failed for ${host}"
+    exit 1
+  done
   ssh -S "${SSH_CTL_DIR}/${name}" -O check -p "${port}" "${user}@${host}" >/dev/null
   INFO "SSH master ready for ${user}@${host}:${port}."
 }
@@ -971,7 +1095,7 @@ LINE
 
 # Resolve effective rsync user for NEW
 RSYNC_USER_NEW_EFFECTIVE="${RSYNC_NEW_USER:-${NEW_USER}}"
-INFO "Options: mode=${MODE}, transfer_mode=${TRANSFER_MODE}, skip_code=${SKIP_CODE}, skip_assets=${SKIP_ASSETS}, skip_db=${SKIP_DB}, db_compress=${DB_COMPRESS}, maintenance=${MAINTENANCE}, dry_run=${DRY_RUN}"
+INFO "Options: mode=${MODE}, transfer_mode=${TRANSFER_MODE}, skip_code=${SKIP_CODE}, skip_assets=${SKIP_ASSETS}, skip_db=${SKIP_DB}, db_compress=${DB_COMPRESS}, maintenance=${MAINTENANCE}, legacy_ssh=${ALLOW_LEGACY_SSH}, dry_run=${DRY_RUN}"
 if [ "${RSYNC_USER_NEW_EFFECTIVE}" != "${NEW_USER}" ]; then
   INFO "Using rsync NEW user override: ${RSYNC_USER_NEW_EFFECTIVE}"
 fi
@@ -1140,7 +1264,12 @@ fi
 if [ "${PLESK_AUTO_SETUP}" = "true" ]; then
   STEP "Ensure Plesk subscription and DB records"
   if [ "${START_STEP:-1}" -le "${STEP_N}" ]; then
-  DB_LIST_CSV="$(IFS=$' '; echo "${DB_LIST[*]}")"
+  DB_LIST_NEW=()
+  for db_spec in "${DB_LIST[@]}"; do
+    parse_db_spec "${db_spec}"
+    DB_LIST_NEW+=("${DB_DST_NAME}")
+  done
+  DB_LIST_CSV="$(IFS=$' '; echo "${DB_LIST_NEW[*]}")"
   NEW_ENV=(
     PLESK_DOMAIN="${PLESK_DOMAIN}"
     PLESK_OWNER="${PLESK_OWNER}"
@@ -1489,15 +1618,9 @@ STEP "Ensure DBs exist on NEW"
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
-for db in "${DB_LIST[@]}"; do
-  if [ "${RUN_FROM}" = "new" ]; then
-    MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
-      -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-  else
-    ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-      "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
-       -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
-  fi
+for db_spec in "${DB_LIST[@]}"; do
+  parse_db_spec "${db_spec}"
+  ensure_new_db "${DB_DST_NAME}"
 done
 INFO "DBs ensured."
 fi
@@ -1506,27 +1629,27 @@ STEP "Migrate DBs with low I/O priority (DB_MODE=${DB_MODE}, compressed ${DB_COM
 if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
   INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
 else
-  for db in "${DB_LIST[@]}"; do
+  for db_spec in "${DB_LIST[@]}"; do
+    parse_db_spec "${db_spec}"
+    SRC_DB="${DB_SRC_NAME}"
+    DST_DB="${DB_DST_NAME}"
     # Ensure target DB exists even when resuming at this step
-    if [ "${RUN_FROM}" = "new" ]; then
-      MYSQL_PWD="${NEW_DB_PASS}" mysql -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" \
-        -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || true
-    else
-      ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-        "MYSQL_PWD='${NEW_DB_PASS}' mysql -h '${NEW_DB_HOST}' -u '${NEW_DB_USER}' \
-         -e \"CREATE DATABASE IF NOT EXISTS \\\`${db}\\\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\"" || true
-    fi
+    ensure_new_db "${DST_DB}"
     # Build ignore-table list for this DB
     TABLES_TO_IGNORE=""
     if [ ${#DB_EXCLUDE_TABLES[@]} -gt 0 ]; then
       for t in "${DB_EXCLUDE_TABLES[@]}"; do
         case "$t" in
           *.*) TABLES_TO_IGNORE+=" $t" ;;
-          *)   TABLES_TO_IGNORE+=" ${db}.$t" ;;
+          *)   TABLES_TO_IGNORE+=" ${SRC_DB}.$t" ;;
         esac
       done
     fi
-    INFO "Migrating DB: ${db}"
+    if [ "${SRC_DB}" = "${DST_DB}" ]; then
+      INFO "Migrating DB: ${SRC_DB}"
+    else
+      INFO "Migrating DB: ${SRC_DB} -> ${DST_DB}"
+    fi
     START=$(tic)
     PV=$(pv_or_cat)
     COMP_CHOICE=none
@@ -1542,7 +1665,7 @@ else
     else
       COMP_CHOICE="${DB_COMPRESS}"
     fi
-    INFO "DB ${db}: compression=${COMP_CHOICE}"
+    INFO "DB ${SRC_DB}: compression=${COMP_CHOICE}"
 
     # Maintenance for WordPress if requested
     if [ "${MODE}" = "wordpress" ]; then
@@ -1573,7 +1696,7 @@ else
 
     # Buffered mode helper: dump -> compress -> store file on NEW -> import -> cleanup
     db_import_buffer() {
-      local DBNAME="$1" TMPFILE comp_ext comp_send comp_decomp WRAP IGNORE_ARGS_STR
+      local SRC_DBNAME="$1" DST_DBNAME="$2" TMPFILE comp_ext comp_send comp_decomp WRAP IGNORE_ARGS_STR
       WRAP=$(io_wrap)
       case "${COMP_CHOICE}" in
         lz4) comp_ext="sql.lz4"; comp_send="lz4 -1"; comp_decomp="lz4 -dc" ;;
@@ -1581,9 +1704,9 @@ else
         none) comp_ext="sql"; comp_send="cat"; comp_decomp="cat" ;;
       esac
       if [ "${RUN_FROM}" = "new" ]; then
-        TMPFILE="$(mktemp "/tmp/${DBNAME}.XXXX.${comp_ext}")"
+        TMPFILE="$(mktemp "/tmp/${DST_DBNAME}.XXXX.${comp_ext}")"
       else
-        TMPFILE="$(ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mktemp /tmp/${DBNAME}.XXXX.${comp_ext}")"
+        TMPFILE="$(ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "mktemp /tmp/${DST_DBNAME}.XXXX.${comp_ext}")"
       fi
       INFO "Uploading dump to NEW: ${TMPFILE}"
       IGNORE_ARGS_STR=""
@@ -1595,51 +1718,61 @@ else
         local BASE_OPTS
         BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
         if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
-        eval ${WRAP:-} "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" ${IGNORE_ARGS_STR} "${DBNAME}" \
+        eval ${WRAP:-} "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" ${IGNORE_ARGS_STR} "${SRC_DBNAME}" \
           | ${comp_send} \
           | ${PV} \
           | ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "cat > '${TMPFILE}'"
       elif [ "${RUN_FROM}" = "new" ]; then
         ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
           OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
-          DBNAME="${DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_SEND="${comp_send}" 'bash -s' <<'REMOTE_OLD_BUF' \
+          DBNAME="${SRC_DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_CHOICE="${COMP_CHOICE}" 'bash -s' <<'REMOTE_OLD_BUF' \
           | ${PV} \
           | cat > "${TMPFILE}"
 set -euo pipefail
 export MYSQL_PWD="${OLD_DB_PASS}"
 if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+case "${COMP_CHOICE}" in
+  lz4) comp_send="lz4 -1" ;;
+  gzip) comp_send="gzip -1" ;;
+  none|*) comp_send="cat" ;;
+esac
 IGNORE_ARGS_STR=""
 for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
 eval "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" \
   --single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 \
-  ${IGNORE_ARGS_STR} "${DBNAME}" | ${COMP_SEND}
+  ${IGNORE_ARGS_STR} "${DBNAME}" | ${comp_send}
 REMOTE_OLD_BUF
       else
         ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
           OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
-          DBNAME="${DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_SEND="${comp_send}" 'bash -s' <<'REMOTE_OLD_BUF' \
+          DBNAME="${SRC_DBNAME}" TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" COMP_CHOICE="${COMP_CHOICE}" 'bash -s' <<'REMOTE_OLD_BUF' \
           | ${PV} \
           | ssh -o LogLevel=ERROR -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "cat > '${TMPFILE}'"
 set -euo pipefail
 export MYSQL_PWD="${OLD_DB_PASS}"
 if command -v mariadb-dump >/dev/null 2>&1; then DUMP="mariadb-dump"; else DUMP="mysqldump"; fi
+case "${COMP_CHOICE}" in
+  lz4) comp_send="lz4 -1" ;;
+  gzip) comp_send="gzip -1" ;;
+  none|*) comp_send="cat" ;;
+esac
 IGNORE_ARGS_STR=""
 for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS_STR+=" --ignore-table='${it}'"; done
 eval "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" \
   --single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 \
-  ${IGNORE_ARGS_STR} "${DBNAME}" | ${COMP_SEND}
+  ${IGNORE_ARGS_STR} "${DBNAME}" | ${comp_send}
 REMOTE_OLD_BUF
       fi
       INFO "Importing ${TMPFILE} on NEW"
       if [ "${RUN_FROM}" = "new" ]; then
         export MYSQL_PWD="${NEW_DB_PASS}"
         { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; ${comp_decomp} "${TMPFILE}"; } \
-          | mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DBNAME}"
+          | mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DST_DBNAME}"
         rm -f "${TMPFILE}"
       else
         ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
           NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
-          TMPFILE="${TMPFILE}" comp_decomp="${comp_decomp}" DBNAME="${DBNAME}" 'bash -s' <<'REMOTE_IMP'
+          TMPFILE="${TMPFILE}" comp_decomp="${comp_decomp}" DBNAME="${DST_DBNAME}" 'bash -s' <<'REMOTE_IMP'
 set -euo pipefail
 export MYSQL_PWD="${NEW_DB_PASS}"
 { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; ${comp_decomp} "${TMPFILE}"; } \
@@ -1651,7 +1784,7 @@ REMOTE_IMP
 
     # Dump -> compress -> import: choose mode
     if [ "${DB_MODE}" = "buffer" ]; then
-      db_import_buffer "${db}"
+      db_import_buffer "${SRC_DB}" "${DST_DB}"
     elif [ "${DB_MODE}" = "stream" ]; then
       # Legacy stream pipeline
       if [ "${RUN_FROM}" = "old" ]; then
@@ -1664,11 +1797,11 @@ REMOTE_IMP
       EXTRA_OPTS=( ${MYSQLDUMP_OPTS_EXTRA[*]} )
       IGNORE_ARGS=()
       for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
-      eval $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${db}"
+      eval $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${SRC_DB}"
     else
       ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
         OLD_DB_PASS="${OLD_DB_PASS}" OLD_DB_HOST="${OLD_DB_HOST}" OLD_DB_USER="${OLD_DB_USER}" \
-        TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" DBNAME="${db}" 'bash -s' <<'REMOTE_OLD'
+        TABLES_TO_IGNORE="${TABLES_TO_IGNORE}" DBNAME="${SRC_DB}" 'bash -s' <<'REMOTE_OLD'
 set -euo pipefail
 export MYSQL_PWD="${OLD_DB_PASS}"
 if command -v ionice >/dev/null 2>&1; then WRAP="ionice -c2 -n7 nice -n 19"; else WRAP="nice -n 19"; fi
@@ -1701,11 +1834,11 @@ REMOTE_OLD
             none) IN="cat" ;;
           esac
           { echo 'SET SESSION net_read_timeout=600; SET SESSION net_write_timeout=600;'; eval $IN; } \
-            | eval $WRAP mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${db}"
+            | eval $WRAP mysql --max_allowed_packet=1073741824 -h "${NEW_DB_HOST}" -u "${NEW_DB_USER}" "${DST_DB}"
         else
           ssh -o LogLevel=ERROR -T -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
             NEW_DB_PASS="${NEW_DB_PASS}" NEW_DB_HOST="${NEW_DB_HOST}" NEW_DB_USER="${NEW_DB_USER}" \
-            COMP_CHOICE="${COMP_CHOICE}" DBNAME="${db}" bash -s <<'REMOTE_NEW'
+            COMP_CHOICE="${COMP_CHOICE}" DBNAME="${DST_DB}" bash -s <<'REMOTE_NEW'
 set -euo pipefail
 set -o pipefail
 export MYSQL_PWD="${NEW_DB_PASS}"
@@ -1722,7 +1855,7 @@ REMOTE_NEW
       }
     else
       # Auto or unknown: robust default to buffered mode
-      db_import_buffer "${db}"
+      db_import_buffer "${SRC_DB}" "${DST_DB}"
     fi
 
     if [ "${MODE}" = "wordpress" ] && [ "${MAINTENANCE}" = "true" ]; then
@@ -1733,7 +1866,7 @@ REMOTE_NEW
         ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "bash -lc 'rm -f \"${OLD_WEB_ROOT%/}/.maintenance\"'" || true
       fi
     fi
-    INFO "DB ${db} migrated in $(toc "$START")"
+    INFO "DB ${SRC_DB} migrated in $(toc "$START")"
   done
 fi
 fi
