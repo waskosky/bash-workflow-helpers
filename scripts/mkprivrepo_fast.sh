@@ -198,7 +198,12 @@ else
     printf '# %s\n\n' "$TITLE"
     printf 'This is a placeholder README created on %s.\n' "$placeholder_ts"
   } > README.md
-  git add README.md
+  cat > .gitattributes <<'EOF'
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+EOF
+  git add README.md .gitattributes
   git commit -m "Add placeholder README" >/dev/null
   HAS_COMMITS=1
 fi
