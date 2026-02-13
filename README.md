@@ -138,3 +138,7 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 - If corporate policy blocks certain visibilities, set `VISIBILITY` accordingly.
 - Shared history changes are idempotent and wrapped in markers with backups; re‑running is safe.
 - To apply shared history immediately in your current Bash session, run: `source ~/.bashrc`.
+- One liner for recommended setup:
+  ```
+  tmp="$(mktemp)" && curl -fLsS "https://raw.githubusercontent.com/waskosky/bash-workflow-helpers/refs/heads/main/recommended_workflow_setup.sh" -o "$tmp" && chmod +x "$tmp" && bash "$tmp" && rm -f "$tmp"
+  ```
