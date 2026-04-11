@@ -142,3 +142,4 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
   ```
   tmp="$(mktemp)" && curl -fLsS "https://raw.githubusercontent.com/waskosky/bash-workflow-helpers/refs/heads/main/recommended_workflow_setup.sh" -o "$tmp" && chmod +x "$tmp" && bash "$tmp" && rm -f "$tmp"
   ```
+  By default, that script uses the parent directory of an existing `bash-workflow-helpers` checkout, your current working directory when run from a temporary download, or `$HOME` if the current directory is `/` or not writable. Override with `WORKFLOW_REPOS_DIR=/path/to/repos`.

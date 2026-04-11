@@ -21,6 +21,39 @@ repo_slug_from_url() {
   fi
 }
 
+ensure_writable_dir() {
+  local dir="$1"
+  mkdir -p "$dir" || die "Could not create repo directory: $dir"
+  [[ -w "$dir" ]] || die "Repo directory is not writable: $dir. Set WORKFLOW_REPOS_DIR to a writable path and rerun."
+}
+
+resolve_repos_dir() {
+  local script_dir="$1"
+  local helpers_repo_url="$2"
+  local current_dir
+  local current_origin
+
+  if [[ -n "${WORKFLOW_REPOS_DIR:-}" ]]; then
+    printf '%s\n' "$WORKFLOW_REPOS_DIR"
+    return 0
+  fi
+
+  if [[ -d "$script_dir/.git" ]]; then
+    current_origin="$(git -C "$script_dir" remote get-url origin 2>/dev/null || true)"
+    if [[ "$(repo_slug_from_url "$current_origin")" == "$(repo_slug_from_url "$helpers_repo_url")" ]]; then
+      (cd "$script_dir/.." && pwd)
+      return 0
+    fi
+  fi
+
+  current_dir="$(pwd)"
+  if [[ "$current_dir" == "/" || ! -w "$current_dir" ]]; then
+    printf '%s\n' "$HOME"
+  else
+    printf '%s\n' "$current_dir"
+  fi
+}
+
 install_gh() {
   if command -v gh >/dev/null 2>&1; then
     log "GitHub CLI (gh) is already installed."
@@ -89,8 +122,10 @@ ensure_nvm_and_node() {
   local npm_version
   node_version="$(node -v)"
   npm_version="$(npm -v)"
-  log "node -v => $node_version (expected v24.13.1)"
-  log "npm -v => $npm_version (expected 11.8.0)"
+  [[ "$node_version" == v24.* ]] || die "Expected Node.js 24.x after nvm install, got $node_version."
+  [[ -n "$npm_version" ]] || die "npm was not available after installing Node.js 24."
+  log "node -v => $node_version"
+  log "npm -v => $npm_version"
 }
 
 repo_has_tracked_changes() {
@@ -152,8 +187,8 @@ main() {
   local current_origin
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  repos_dir="${WORKFLOW_REPOS_DIR:-$(cd "$script_dir/.." && pwd)}"
-  mkdir -p "$repos_dir"
+  repos_dir="$(resolve_repos_dir "$script_dir" "$helpers_repo_url")"
+  ensure_writable_dir "$repos_dir"
   log "Using repo directory: $repos_dir"
 
   install_gh
