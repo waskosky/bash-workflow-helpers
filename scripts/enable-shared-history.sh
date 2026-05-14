@@ -266,8 +266,7 @@ install_systemwide() {
     else
       echo "+ Installed $dropin"
     fi
-    sudo tee "$dropin" >/dev/null < "$tmp"
-    sudo chmod 0644 "$dropin"
+    sudo install -m 0644 "$tmp" "$dropin"
     rm -f "$tmp"
   else
     # Fallback to global bashrc if profile.d doesn't exist

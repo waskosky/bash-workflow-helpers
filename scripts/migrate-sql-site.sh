@@ -70,6 +70,18 @@ toc() { local s="$1"; echo "$(( $(date +%s) - s ))s"; }
 # ---------- helpers ----------
 io_wrap() { if command -v ionice >/dev/null 2>&1; then echo "ionice -c2 -n7 nice -n 19"; else echo "nice -n 19"; fi; }
 pv_or_cat() { if command -v pv >/dev/null 2>&1; then echo "pv -brat"; else echo "cat"; fi; }
+sh_escape() { printf %s "$1" | sed -e "s/'/'\\''/g"; }
+sh_quote() { printf "'%s'" "$(sh_escape "$1")"; }
+remote_bash_command() {
+  local script="$1"
+  shift
+  local cmd arg
+  cmd="bash -c $(sh_quote "$script") bash"
+  for arg in "$@"; do
+    cmd+=" $(sh_quote "$arg")"
+  done
+  printf '%s' "$cmd"
+}
 
 SSH_CTL_DIR="${HOME}/.ssh/ctl-mux"
 mkdir -p "${SSH_CTL_DIR}"; chmod 700 "${SSH_CTL_DIR}"
@@ -116,17 +128,27 @@ tar_stream_copy() {
   local dest_dir="$1"; shift
   local tar_excludes=("$@")
   INFO "Streaming tar from OLD:${src_dir} to NEW:${dest_dir} (no delete)."
-  # Build exclude args for GNU tar
-  local exargs=()
-  for pat in "${tar_excludes[@]}"; do
-    exargs+=(--exclude="$pat")
-  done
-  local PV=$(pv_or_cat)
-  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" \
-    "bash -lc 'set -euo pipefail; tar -C "'"'${src_dir}'"' -cpf - ${exargs[*]} .'" | \
-  ${PV} | \
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-    "bash -lc 'set -euo pipefail; mkdir -p "'"'${dest_dir}'"' && tar -C "'"'${dest_dir}'"' -xpf -'"
+  local pv_cmd
+  read -r -a pv_cmd <<< "$(pv_or_cat)"
+  local old_tar_script='set -euo pipefail
+src=$1
+shift
+exargs=()
+for pat in "$@"; do
+  [ -n "$pat" ] && exargs+=(--exclude="$pat")
+done
+tar -C "$src" -cpf - "${exargs[@]}" .'
+  local new_extract_script='set -euo pipefail
+dest=$1
+mkdir -p "$dest"
+tar -C "$dest" -xpf -'
+  local old_tar_cmd new_extract_cmd
+  old_tar_cmd="$(remote_bash_command "$old_tar_script" "${src_dir%/}" "${tar_excludes[@]}")"
+  new_extract_cmd="$(remote_bash_command "$new_extract_script" "${dest_dir%/}")"
+
+  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "$old_tar_cmd" \
+    | "${pv_cmd[@]}" \
+    | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "$new_extract_cmd"
 }
 
 describe_ssh_auth() {

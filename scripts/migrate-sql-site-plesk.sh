@@ -18,6 +18,17 @@ load_config() {
   fi
 }
 _sh_escape() { printf %s "$1" | sed -e "s/'/'\\''/g"; }
+sh_quote() { printf "'%s'" "$(_sh_escape "$1")"; }
+remote_bash_command() {
+  local script="$1"
+  shift
+  local cmd arg
+  cmd="bash -c $(sh_quote "$script") bash"
+  for arg in "$@"; do
+    cmd+=" $(sh_quote "$arg")"
+  done
+  printf '%s' "$cmd"
+}
 save_config() {
   ensure_config_dir
   tmp="${CONFIG_FILE}.tmp$$"
@@ -100,7 +111,8 @@ TRANSFER_MODE="${TRANSFER_MODE:-direct}"
 RSYNC_NEW_USER="${RSYNC_NEW_USER:-}" # override NEW_USER used for rsync/upload
 RSYNC_EXCLUDES="${RSYNC_EXCLUDES:-logs tmp}"
 START_STEP="${START_STEP:-1}"
-DB_EXCLUDE_TABLES=(${DB_EXCLUDE_TABLES:-})
+DB_EXCLUDE_TABLES=()
+read -r -a DB_EXCLUDE_TABLES <<< "${DB_EXCLUDE_TABLES:-}"
 
 # Legacy safety: stop excluding vendor so plugin/composer deps migrate
 if [[ " ${RSYNC_EXCLUDES} " == *" vendor "* ]]; then
@@ -117,10 +129,10 @@ if [[ " ${RSYNC_EXCLUDES} " == *" vendor "* ]]; then
 fi
 
 # Extra client options for huge dumps/imports
-MYSQLDUMP_OPTS_DEFAULT=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4 --column-statistics=0)
-MYSQLDUMP_OPTS_EXTRA=(${MYSQLDUMP_OPTS_EXTRA:-})
-MYSQL_IMPORT_OPTS_DEFAULT=(--max_allowed_packet=1G --net_buffer_length=1048576)
-MYSQL_IMPORT_OPTS_EXTRA=(${MYSQL_IMPORT_OPTS_EXTRA:-})
+MYSQLDUMP_OPTS_EXTRA=()
+MYSQL_IMPORT_OPTS_EXTRA=()
+read -r -a MYSQLDUMP_OPTS_EXTRA <<< "${MYSQLDUMP_OPTS_EXTRA:-}"
+read -r -a MYSQL_IMPORT_OPTS_EXTRA <<< "${MYSQL_IMPORT_OPTS_EXTRA:-}"
 
 usage() {
   cat <<EOF
@@ -252,7 +264,8 @@ NEW_DB_USER="${NEW_DB_USER:-appuser}"
 NEW_DB_PASS="${NEW_DB_PASS:-newpass}"
 
 # Databases to migrate (space-separated)
-DB_LIST=(${DB_LIST:-appdb analyticsdb})
+DB_LIST=()
+read -r -a DB_LIST <<< "${DB_LIST:-appdb analyticsdb}"
 
 # Optional replacements across text columns and config files
 # If OLD_* equals NEW_*, the script skips that replacement.
@@ -290,8 +303,10 @@ log_structured() {
   local level="$1"; shift
   local message="$1"; shift
   local meta="${1:-}"
-  local ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  local payload="{\"ts\":\"${ts}\",\"level\":\"${level}\",\"message\":\"$(json_escape "$message")\""
+  local ts
+  local payload
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  payload="{\"ts\":\"${ts}\",\"level\":\"${level}\",\"message\":\"$(json_escape "$message")\""
   if [ -n "$meta" ]; then
     payload="${payload},\"meta\":${meta}"
   fi
@@ -931,62 +946,50 @@ tar_stream_copy() {
   local dest_dir="$1"; shift
   local tar_excludes=("$@")
   INFO "Streaming tar from OLD:${src_dir} to NEW:${dest_dir} (no delete)."
-  local EXCL
-  EXCL="${tar_excludes[*]}"
-  local PV
-  PV=$(pv_or_cat)
+  local pv_cmd
+  read -r -a pv_cmd <<< "$(pv_or_cat)"
+
+  local old_tar_script='set -euo pipefail
+src=$1
+shift
+exargs=()
+for pat in "$@"; do
+  [ -n "$pat" ] && exargs+=(--exclude="$pat")
+done
+tar -C "$src" -cpf - "${exargs[@]}" .'
+  local new_extract_script='set -euo pipefail
+dest=$1
+mkdir -p "$dest"
+tar -C "$dest" -xpf -'
+
   if [ "${RUN_FROM}" = "old" ]; then
-    # Local tar on OLD → ssh NEW
+    # Local tar on OLD -> ssh NEW.
     local exargs=()
-    for pat in ${EXCL}; do [ -n "$pat" ] && exargs+=(--exclude="$pat"); done
+    for pat in "${tar_excludes[@]}"; do [ -n "$pat" ] && exargs+=(--exclude="$pat"); done
+    local new_extract_cmd
+    new_extract_cmd="$(remote_bash_command "$new_extract_script" "${dest_dir%/}")"
     tar -C "${src_dir%/}" -cpf - "${exargs[@]}" . \
-      | ${PV} \
+      | "${pv_cmd[@]}" \
       | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" \
-          DEST="${dest_dir%/}" 'bash -s' <<'REMOTE2'
-set -euo pipefail
-mkdir -p "$DEST"
-tar -C "$DEST" -xpf -
-REMOTE2
+          "$new_extract_cmd"
   elif [ "${RUN_FROM}" = "new" ]; then
-    # Remote tar on OLD → local extract on NEW
-    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<REMOTE | \
-  ${PV} | \
-  bash -s <<REMOTE2
-set -euo pipefail
-SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
-declare -a exargs=()
-for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
-if [ "\${#exargs[@]}" -gt 0 ]; then
-  tar -C "\$SRC" -cpf - "\${exargs[@]}" .
-else
-  tar -C "\$SRC" -cpf - .
-fi
-REMOTE
-set -euo pipefail
-DEST="${dest_dir%/}"
-mkdir -p "\$DEST"
-tar -C "\$DEST" -xpf -
-REMOTE2
+    # Remote tar on OLD -> local extract on NEW.
+    local old_tar_cmd
+    old_tar_cmd="$(remote_bash_command "$old_tar_script" "${src_dir%/}" "${tar_excludes[@]}")"
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "$old_tar_cmd" \
+      | "${pv_cmd[@]}" \
+      | {
+          mkdir -p "${dest_dir%/}"
+          tar -C "${dest_dir%/}" -xpf -
+        }
   else
-    # Remote tar on OLD → ssh NEW
-  ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" 'bash -s' <<REMOTE | \
-  ${PV} | \
-  ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" 'bash -s' <<REMOTE2
-set -euo pipefail
-SRC="${src_dir%/}"; EXCL_LIST="${EXCL}"
-declare -a exargs=()
-for pat in ${EXCL_LIST:-}; do [ -n "\$pat" ] && exargs+=(--exclude="\$pat"); done
-if [ "\${#exargs[@]}" -gt 0 ]; then
-  tar -C "\$SRC" -cpf - "\${exargs[@]}" .
-else
-  tar -C "\$SRC" -cpf - .
-fi
-REMOTE
-set -euo pipefail
-DEST="${dest_dir%/}"
-mkdir -p "\$DEST"
-tar -C "\$DEST" -xpf -
-REMOTE2
+    # Remote tar on OLD -> ssh NEW.
+    local old_tar_cmd new_extract_cmd
+    old_tar_cmd="$(remote_bash_command "$old_tar_script" "${src_dir%/}" "${tar_excludes[@]}")"
+    new_extract_cmd="$(remote_bash_command "$new_extract_script" "${dest_dir%/}")"
+    ssh -S "${SSH_CTL_DIR}/old" -p "${OLD_SSH_PORT}" "${OLD_USER}@${OLD_HOST}" "$old_tar_cmd" \
+      | "${pv_cmd[@]}" \
+      | ssh -S "${SSH_CTL_DIR}/new" -p "${NEW_SSH_PORT}" "${NEW_USER}@${NEW_HOST}" "$new_extract_cmd"
   fi
 }
 
@@ -1473,16 +1476,17 @@ else
       if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
         INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
       else
-      START=$(tic)
-      if [ "${RUN_FROM}" = "old" ]; then
-        rsync_push_code_from_old_to_new
-      else
-        if ! rsync_direct_pull_from_old_to_new_code; then
-          WARN "Direct rsync failed or not available; falling back to stream mode for code (no delete)."
-          tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" ${RSYNC_EXCLUDES} "${ASSETS_DIR}"
+        START=$(tic)
+        if [ "${RUN_FROM}" = "old" ]; then
+          rsync_push_code_from_old_to_new
+        else
+          if ! rsync_direct_pull_from_old_to_new_code; then
+            WARN "Direct rsync failed or not available; falling back to stream mode for code (no delete)."
+            read -r -a _rsync_exclude_args <<< "${RSYNC_EXCLUDES:-}"
+            tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" "${_rsync_exclude_args[@]}" "${ASSETS_DIR}"
+          fi
         fi
-      fi
-      INFO "Code synced in $(toc "$START")"
+        INFO "Code synced in $(toc "$START")"
       fi
       ;;
     stream)
@@ -1490,9 +1494,10 @@ else
       if [ "${START_STEP:-1}" -gt "${STEP_N}" ]; then
         INFO "Skipping step ${STEP_N} due to --start-step=${START_STEP}"
       else
-      START=$(tic)
-      tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" ${RSYNC_EXCLUDES} "${ASSETS_DIR}"
-      INFO "Code streamed in $(toc "$START")"
+        START=$(tic)
+        read -r -a _rsync_exclude_args <<< "${RSYNC_EXCLUDES:-}"
+        tar_stream_copy "${OLD_WEB_ROOT}" "${NEW_WEB_ROOT}" "${_rsync_exclude_args[@]}" "${ASSETS_DIR}"
+        INFO "Code streamed in $(toc "$START")"
       fi
       ;;
     *)
@@ -1794,7 +1799,7 @@ REMOTE_IMP
       BASE_OPTS=(--single-transaction --quick --routines --triggers --events --no-tablespaces --default-character-set=utf8mb4)
       BASE_OPTS+=(--max-allowed-packet=1073741824)
       if "$DUMP" --help 2>/dev/null | grep -q -- "--column-statistics"; then BASE_OPTS+=(--column-statistics=0); fi
-      EXTRA_OPTS=( ${MYSQLDUMP_OPTS_EXTRA[*]} )
+      EXTRA_OPTS=("${MYSQLDUMP_OPTS_EXTRA[@]}")
       IGNORE_ARGS=()
       for it in ${TABLES_TO_IGNORE}; do IGNORE_ARGS+=(--ignore-table="$it"); done
       eval $WRAP "$DUMP" -h "${OLD_DB_HOST}" -u "${OLD_DB_USER}" "${BASE_OPTS[@]}" "${EXTRA_OPTS[@]}" "${IGNORE_ARGS[@]}" "${SRC_DB}"

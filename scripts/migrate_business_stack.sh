@@ -32,6 +32,34 @@ load_bus_config() {
   fi
 }
 _sh_escape() { printf %s "$1" | sed -e "s/'/'\\''/g"; }
+sh_quote() { printf "'%s'" "$(_sh_escape "$1")"; }
+join_quoted_args() {
+  local arg
+  for arg in "$@"; do
+    printf ' %s' "$(sh_quote "$arg")"
+  done
+}
+set_env_assignment() {
+  local file="$1" key="$2" value="$3" tmp assignment
+  assignment="${key}=$(sh_quote "$value")"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v assignment="$assignment" '
+    $0 ~ "^[[:space:]]*#?[[:space:]]*" key "=" {
+      if (!done) {
+        print assignment
+        done=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print assignment
+      }
+    }
+  ' "$file" >"$tmp"
+  mv -f "$tmp" "$file"
+}
 save_bus_config() {
   ensure_bus_config_dir
   local tmp="${BUS_CONFIG_FILE}.tmp$$"
@@ -40,7 +68,6 @@ save_bus_config() {
     echo "NEW_HOST='$( _sh_escape "${NEW_HOST:-}")'"
     echo "NEW_SSH_USER='$( _sh_escape "${NEW_SSH_USER:-}")'"
     echo "NEW_SSH_PORT='$( _sh_escape "${NEW_SSH_PORT:-}")'"
-    echo "NEW_SSH_PASS='$( _sh_escape "${NEW_SSH_PASS:-}")'"
     echo "SRC_HOST='$( _sh_escape "${SRC_HOST:-}")'"
     echo "SRC_SSH_USER='$( _sh_escape "${SRC_SSH_USER:-}")'"
     echo "SRC_SSH_PORT='$( _sh_escape "${SRC_SSH_PORT:-}")'"
@@ -222,7 +249,7 @@ if [ "${ORIGIN_MODE}" = "old" ]; then
     fi
   }
   _rsync_to_new() { # localdir remotedir
-    if [ -n "${NEW_SSH_PASS}" ] && command -v sshpass >/devnull 2>&1; then
+    if [ -n "${NEW_SSH_PASS}" ] && command -v sshpass >/dev/null 2>&1; then
       sshpass -p "${NEW_SSH_PASS}" rsync -aHAX -e "ssh -p ${NEW_SSH_PORT} -o StrictHostKeyChecking=accept-new" "$1" "${NEW_SSH_USER}@${NEW_HOST}:$2" 2>/dev/null || true
     else
       rsync -aHAX -e "ssh -p ${NEW_SSH_PORT} -o StrictHostKeyChecking=accept-new" "$1" "${NEW_SSH_USER}@${NEW_HOST}:$2" 2>/dev/null || true
@@ -276,22 +303,17 @@ if [ "${ORIGIN_MODE}" = "old" ]; then
   fi
   # Execute on NEW as root
   # Pass SRC_SSH_PASS ephemerally if provided
+  REMOTE_ARGS_STR="$(join_quoted_args "${REMOTE_ARGS[@]}")"
+  REMOTE_CMD="sudo -E bash /root/migration/migrate_business_stack.sh${REMOTE_ARGS_STR}"
+  if [ -n "${SRC_SSH_PASS:-}" ]; then
+    REMOTE_CMD="SRC_SSH_PASS=$(sh_quote "$SRC_SSH_PASS") ${REMOTE_CMD}"
+  fi
   if [ -n "${NEW_SSH_PASS}" ] && command -v sshpass >/dev/null 2>&1; then
-    if [ -n "${SRC_SSH_PASS:-}" ]; then
-      sshpass -p "${NEW_SSH_PASS}" ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
-        "SRC_SSH_PASS='$(printf %s "${SRC_SSH_PASS}" | sed -e "s/'/'\\''/g")' sudo -E bash /root/migration/migrate_business_stack.sh ${REMOTE_ARGS[*]}"
-    else
-      sshpass -p "${NEW_SSH_PASS}" ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
-        "sudo -E bash /root/migration/migrate_business_stack.sh ${REMOTE_ARGS[*]}"
-    fi
+    sshpass -p "${NEW_SSH_PASS}" ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
+      "$REMOTE_CMD"
   else
-    if [ -n "${SRC_SSH_PASS:-}" ]; then
-      ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
-        "SRC_SSH_PASS='$(printf %s "${SRC_SSH_PASS}" | sed -e "s/'/'\\''/g")' sudo -E bash /root/migration/migrate_business_stack.sh ${REMOTE_ARGS[*]}"
-    else
-      ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
-        "sudo -E bash /root/migration/migrate_business_stack.sh ${REMOTE_ARGS[*]}"
-    fi
+    ssh -A -t -p "${NEW_SSH_PORT}" -o ForwardAgent=yes -o StrictHostKeyChecking=accept-new "${NEW_SSH_USER}@${NEW_HOST}" \
+      "$REMOTE_CMD"
   fi
   exit $?
 fi
@@ -338,19 +360,19 @@ EOF_ENV
 
 # Apply CLI overrides into migration.env
 if [ -n "${CLI_PLESK_EXPECTED:-}" ]; then
-  sed -i -E "s/^PLESK_EXPECTED=.*/PLESK_EXPECTED=\"${CLI_PLESK_EXPECTED}\"/" /root/migration/migration.env
+  set_env_assignment /root/migration/migration.env PLESK_EXPECTED "$CLI_PLESK_EXPECTED"
 fi
 if [ -n "${SRC_HOST:-}" ]; then
-  sed -i -E "s/^SRC_HOST=.*/SRC_HOST=\"${SRC_HOST}\"/" /root/migration/migration.env
+  set_env_assignment /root/migration/migration.env SRC_HOST "$SRC_HOST"
 fi
 if [ -n "${SRC_SSH_USER:-}" ]; then
-  sed -i -E "s/^SRC_SSH_USER=.*/SRC_SSH_USER=\"${SRC_SSH_USER}\"/" /root/migration/migration.env
+  set_env_assignment /root/migration/migration.env SRC_SSH_USER "$SRC_SSH_USER"
 fi
 if [ -n "${SRC_SSH_PORT:-}" ]; then
-  sed -i -E "s/^SRC_SSH_PORT=.*/SRC_SSH_PORT=${SRC_SSH_PORT}/" /root/migration/migration.env
+  set_env_assignment /root/migration/migration.env SRC_SSH_PORT "$SRC_SSH_PORT"
 fi
 if [ -n "${SSH_IDENTITY_FILE:-}" ]; then
-  sed -i -E "s|^#?\s*SSH_IDENTITY_FILE=.*|SSH_IDENTITY_FILE=\"${SSH_IDENTITY_FILE}\"|" /root/migration/migration.env
+  set_env_assignment /root/migration/migration.env SSH_IDENTITY_FILE "$SSH_IDENTITY_FILE"
 fi
 
 cat > /root/migration/migrate_services.sh <<'EOF_MAIN'

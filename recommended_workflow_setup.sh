@@ -100,17 +100,30 @@ EOF
   log "GitHub CLI git credential integration is configured."
 }
 
+resolve_nvm_dir() {
+  if [[ -n "${NVM_DIR:-}" ]]; then
+    printf '%s\n' "$NVM_DIR"
+  elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    printf '%s\n' "$XDG_CONFIG_HOME/nvm"
+  else
+    printf '%s\n' "$HOME/.nvm"
+  fi
+}
+
 ensure_nvm_and_node() {
-  local nvm_dir="$HOME/.nvm"
+  local nvm_dir
+  nvm_dir="$(resolve_nvm_dir)"
   local nvm_script="$nvm_dir/nvm.sh"
+  export NVM_DIR="$nvm_dir"
 
   if [[ ! -s "$nvm_script" ]]; then
-    log "Installing nvm v0.40.3."
+    log "Installing nvm v0.40.3 to $nvm_dir."
     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
   else
-    log "nvm is already installed."
+    log "nvm is already installed at $nvm_dir."
   fi
 
+  [[ -s "$nvm_script" ]] || die "Expected nvm to be installed at $nvm_script, but it was not found."
   # shellcheck disable=SC1090
   . "$nvm_script"
   command -v nvm >/dev/null 2>&1 || die "nvm was not available after sourcing $nvm_script."

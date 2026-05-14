@@ -43,7 +43,15 @@ Examples:
 USAGE
 }
 
-SAVE_DEFAULTS=false
+sh_escape() { printf %s "$1" | sed -e "s/'/'\\''/g"; }
+sh_quote() { printf "'%s'" "$(sh_escape "$1")"; }
+join_quoted_args() {
+  local arg
+  for arg in "$@"; do
+    printf ' %s' "$(sh_quote "$arg")"
+  done
+}
+
 while [[ ${1:-} == --* ]]; do
   case "$1" in
     --out) OUT="$2"; shift 2 ;;
@@ -134,8 +142,12 @@ fi
 # 5) Cron: package system and user crons
 log "Packaging cron jobs"
 mkdir -p "$STAGE/cron/system" "$STAGE/cron/users"
-[ -f /etc/crontab ] && cp -a /etc/crontab "$STAGE/cron/system/crontab" || true
-[ -d /etc/cron.d ] && rsync -a /etc/cron.d/ "$STAGE/cron/system/cron.d/" || true
+if [ -f /etc/crontab ]; then
+  cp -a /etc/crontab "$STAGE/cron/system/crontab" || true
+fi
+if [ -d /etc/cron.d ]; then
+  rsync -a /etc/cron.d/ "$STAGE/cron/system/cron.d/" || true
+fi
 if [ -d /var/spool/cron/crontabs ]; then
   rsync -a /var/spool/cron/crontabs/ "$STAGE/cron/users/" || true
 elif [ -d /var/spool/cron ]; then
@@ -206,12 +218,13 @@ if [ -n "$NEW_HOST" ]; then
     IM_FLAGS=(--package "$REMOTE_PATH")
     [ -n "$IM_PLESK" ] && IM_FLAGS+=(--plesk "$IM_PLESK")
     [ -n "$IM_PHP_VER" ] && IM_FLAGS+=(--php "$IM_PHP_VER")
+    IMPORTER_CMD="sudo bash $(sh_quote "$IMPORTER_REMOTE")$(join_quoted_args "${IM_FLAGS[@]}")"
     if [ -n "$NEW_PASS" ] && command -v sshpass >/dev/null 2>&1; then
       sshpass -p "$NEW_PASS" ssh -t -p "$NEW_PORT" -o StrictHostKeyChecking=accept-new "$NEW_USER@$NEW_HOST" \
-        "sudo bash '$IMPORTER_REMOTE' ${IM_FLAGS[*]}"
+        "$IMPORTER_CMD"
     else
       ssh -t -p "$NEW_PORT" -o StrictHostKeyChecking=accept-new "$NEW_USER@$NEW_HOST" \
-        "sudo bash '$IMPORTER_REMOTE' ${IM_FLAGS[*]}"
+        "$IMPORTER_CMD"
     fi
   else
     log "Importer uploaded. To run on NEW: sudo bash '$IMPORTER_REMOTE' --package '$REMOTE_PATH'"
