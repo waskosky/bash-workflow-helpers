@@ -60,20 +60,12 @@ install_gh() {
     return 0
   fi
 
-  log "GitHub CLI (gh) not found. Attempting automatic install."
+  log "GitHub CLI (gh) not found."
   if command -v brew >/dev/null 2>&1; then
+    log "Installing gh with Homebrew."
     brew install gh
-  elif command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update
-    sudo apt-get install -y gh
-  elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y gh
-  elif command -v yum >/dev/null 2>&1; then
-    sudo yum install -y gh
-  elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --noconfirm github-cli
   else
-    die "Could not auto-install gh. Install it from https://cli.github.com/ and rerun."
+    die "GitHub CLI (gh) is required. Install it without sudo or make it available on PATH, then rerun. See https://cli.github.com/."
   fi
 
   command -v gh >/dev/null 2>&1 || die "gh install step finished but command is still unavailable."
@@ -178,6 +170,7 @@ sync_repo() {
 run_repo_script() {
   local repo_dir="$1"
   local script_name="$2"
+  shift 2
   local script_path="$repo_dir/$script_name"
 
   [[ -f "$script_path" ]] || die "Expected script not found: $script_path"
@@ -185,7 +178,7 @@ run_repo_script() {
   log "Running $script_name in $repo_dir"
   (
     cd "$repo_dir"
-    "./$script_name"
+    "./$script_name" "$@"
   )
 }
 
@@ -223,7 +216,7 @@ main() {
   run_repo_script "$helpers_repo_dir" "setup_newrepo.sh"
 
   sync_repo "https://github.com/waskosky/bash-git-simplified" "$repos_dir/bash-git-simplified"
-  run_repo_script "$repos_dir/bash-git-simplified" "install.sh"
+  run_repo_script "$repos_dir/bash-git-simplified" "install.sh" "path"
 
   log "Recommended workflow setup complete."
 }

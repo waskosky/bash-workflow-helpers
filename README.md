@@ -25,7 +25,7 @@ These scripts are idempotent, make backups before editing your shell rc files, a
 
 This will:
 
-- Ensure `gh` is installed and authenticated for Git operations.
+- Verify `gh` is installed and authenticated for Git operations.
 - Add `~/.local/bin` to your `PATH` if needed.
 - Symlink `~/.local/bin/newrepo` → `scripts/mkprivrepo_fast.sh`.
 
@@ -113,7 +113,7 @@ Environment knobs:
 
 One‑time helper that:
 
-- Ensures `gh` is installed and authenticated; runs `gh auth setup-git`.
+- Verifies `gh` is installed and authenticated; runs `gh auth setup-git`.
 - Creates `~/.local/bin/newrepo` symlink to `scripts/mkprivrepo_fast.sh`.
 - Adds `~/.local/bin` to your `PATH` in Bash/Zsh if missing.
 
@@ -135,6 +135,7 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 ## Notes & troubleshooting
 
 - If `gh` isn’t logged in, scripts will prompt for web login.
+- The recommended setup does not run sudo package installs. Install `gh` first or make it available on `PATH`; if Homebrew is available, the setup can install `gh` with `brew`.
 - If corporate policy blocks certain visibilities, set `VISIBILITY` accordingly.
 - Shared history changes are idempotent and wrapped in markers with backups; re‑running is safe.
 - To apply shared history immediately in your current Bash session, run: `source ~/.bashrc`.
