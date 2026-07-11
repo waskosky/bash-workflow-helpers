@@ -90,7 +90,21 @@ test_nvm_install_uses_xdg_config_home() {
   )
 }
 
-test_install_gh_does_not_attempt_sudo_package_install() {
+test_gh_release_platform_mapping() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+
+  [[ "$(gh_release_os Linux)" == "linux" ]] || fail "expected Linux gh release mapping"
+  [[ "$(gh_release_os Darwin)" == "macOS" ]] || fail "expected macOS gh release mapping"
+  [[ "$(gh_release_os MINGW64_NT-10.0)" == "windows" ]] || fail "expected Windows gh release mapping"
+  [[ "$(gh_release_arch x86_64)" == "amd64" ]] || fail "expected amd64 gh release mapping"
+  [[ "$(gh_release_arch aarch64)" == "arm64" ]] || fail "expected arm64 gh release mapping"
+}
+
+test_install_gh_auto_installs_without_sudo() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' RETURN
@@ -104,18 +118,45 @@ exit 89"
 
   (
     load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+    export HOME="$tmp_dir/home"
     export PATH="$tmp_dir/bin"
+    hash -r
 
-    set +e
-    output="$(install_gh 2>&1)"
-    status=$?
-    set -e
+    install_gh_from_release() {
+      printf 'called\n' >"$tmp_dir/release-installer-called"
+      gh() { :; }
+    }
+
+    install_gh >/dev/null
 
     [[ ! -e "$tmp_dir/sudo.log" ]] || fail "install_gh must not invoke sudo package installs"
-    [[ "$status" -ne 0 ]] || fail "expected install_gh to fail when gh is unavailable"
-    [[ "$output" == *"GitHub CLI (gh) is required"* ]] \
-      || fail "expected install_gh to explain the gh prerequisite"
+    [[ -e "$tmp_dir/release-installer-called" ]] \
+      || fail "expected install_gh to invoke the release installer"
   )
+}
+
+test_coding_agent_install_sources_bashrc_and_uses_npm_global() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$tmp_dir/bin" "$tmp_dir/home"
+  printf 'export BASHRC_SOURCED_FOR_TEST=yes\n' >"$tmp_dir/home/.bashrc"
+  make_executable "$tmp_dir/bin/npm" '#!/usr/bin/env bash
+printf "%s|%s\n" "${BASHRC_SOURCED_FOR_TEST:-no}" "$*" >"$NPM_INSTALL_RECORD"'
+
+  (
+    export HOME="$tmp_dir/home"
+    export NPM_INSTALL_RECORD="$tmp_dir/npm-install-record"
+    export PATH="$tmp_dir/bin:$PATH"
+    load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+
+    install_coding_agents >/dev/null
+  )
+
+  [[ "$(cat "$tmp_dir/npm-install-record")" == \
+    "yes|install --global @anthropic-ai/claude-code @openai/codex" ]] \
+    || fail "expected bashrc sourcing before the global coding-agent npm install"
 }
 
 test_main_uses_no_sudo_bash_git_simplified_install_method() {
@@ -130,14 +171,17 @@ test_main_uses_no_sudo_bash_git_simplified_install_method() {
 
     load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
 
-    require_command() { :; }
-    install_gh() { :; }
-    ensure_gh_personal_login() { :; }
-    ensure_nvm_and_node() { :; }
+    record_step() { printf '%s\n' "$1" >>"$tmp_dir/main-steps"; }
+    require_command() { record_step "require_command:$1"; }
+    install_gh() { record_step "install_gh"; }
+    ensure_gh_personal_login() { record_step "ensure_gh_personal_login"; }
+    ensure_nvm_and_node() { record_step "ensure_nvm_and_node"; }
+    install_coding_agents() { record_step "install_coding_agents"; }
     sync_repo() {
       local repo_url="$1"
       local repo_dir="$2"
 
+      record_step "sync_repo:$repo_url"
       mkdir -p "$repo_dir"
       case "$repo_url" in
         *codex-cli-farm)
@@ -169,10 +213,16 @@ printf '%s\n' \"\$method\" > '$tmp_dir/bash-git-simplified-method'
     [[ "$status" -eq 0 ]] || fail "main should install bash-git-simplified with path method"
     [[ "$(cat "$tmp_dir/bash-git-simplified-method")" == "path" ]] \
       || fail "expected bash-git-simplified install method to be path"
+    [[ "$(head -n1 "$tmp_dir/main-steps")" == "install_gh" ]] \
+      || fail "expected gh installation to be the first main setup step"
+    [[ "$(tail -n1 "$tmp_dir/main-steps")" == "install_coding_agents" ]] \
+      || fail "expected coding-agent installation to be the final main setup step"
   )
 }
 
 test_nvm_install_uses_xdg_config_home
-test_install_gh_does_not_attempt_sudo_package_install
+test_gh_release_platform_mapping
+test_install_gh_auto_installs_without_sudo
+test_coding_agent_install_sources_bashrc_and_uses_npm_global
 test_main_uses_no_sudo_bash_git_simplified_install_method
 printf 'ok - recommended_workflow_setup regression checks\n'

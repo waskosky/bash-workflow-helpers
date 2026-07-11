@@ -128,14 +128,15 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 ## Requirements
 
 - Bash 4+ and standard Unix tools (`awk`, `sed`, `curl`).
-- `git` and the GitHub CLI (`gh`).
+- `git`. The recommended workflow setup installs the GitHub CLI (`gh`) automatically when needed.
 - Optional: GitHub Desktop for repo registration.
 - OS: Linux, macOS, and WSL are supported; Windows via Git Bash may also work for `newrepo`.
 
 ## Notes & troubleshooting
 
 - If `gh` isn’t logged in, scripts will prompt for web login.
-- The recommended setup does not run sudo package installs. Install `gh` first or make it available on `PATH`; if Homebrew is available, the setup can install `gh` with `brew`.
+- If `gh` is missing, the recommended setup installs it before using it. It tries Homebrew when available, then falls back to the latest official Linux, macOS, or Windows release in `~/.local/bin`, without `sudo`. Set `GH_CLI_VERSION` to pin a release or `GH_INSTALL_DIR` to change the user-local destination.
+- At the end of the recommended setup, the script sources `~/.bashrc` in its own process and globally installs `@anthropic-ai/claude-code` and `@openai/codex` with npm so the `claude` and `codex` commands are ready in future shells.
 - If corporate policy blocks certain visibilities, set `VISIBILITY` accordingly.
 - Shared history changes are idempotent and wrapped in markers with backups; re‑running is safe.
 - To apply shared history immediately in your current Bash session, run: `source ~/.bashrc`.
