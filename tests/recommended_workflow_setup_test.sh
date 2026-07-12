@@ -184,7 +184,7 @@ test_main_uses_no_sudo_bash_git_simplified_install_method() {
       record_step "sync_repo:$repo_url"
       mkdir -p "$repo_dir"
       case "$repo_url" in
-        *codex-cli-farm)
+        *agent-cli-farm)
           make_executable "$repo_dir/setup.sh" '#!/usr/bin/env bash
 exit 0'
           ;;
@@ -217,7 +217,29 @@ printf '%s\n' \"\$method\" > '$tmp_dir/bash-git-simplified-method'
       || fail "expected gh installation to be the first main setup step"
     [[ "$(tail -n1 "$tmp_dir/main-steps")" == "install_coding_agents" ]] \
       || fail "expected coding-agent installation to be the final main setup step"
+    grep -Fxq "sync_repo:https://github.com/waskosky/agent-cli-farm" "$tmp_dir/main-steps" \
+      || fail "expected canonical agent-cli-farm clone URL"
   )
+}
+
+test_legacy_agent_farm_checkout_is_migrated() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  local legacy_dir="$tmp_dir/codex-cli-farm"
+  local canonical_dir="$tmp_dir/agent-cli-farm"
+  local canonical_url="https://github.com/waskosky/agent-cli-farm"
+  git init -q "$legacy_dir"
+  git -C "$legacy_dir" remote add origin "https://github.com/waskosky/codex-cli-farm"
+
+  load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+  migrate_agent_cli_farm_checkout "$canonical_url" "$legacy_dir" "$canonical_dir"
+
+  [[ ! -e "$legacy_dir" ]] || fail "expected legacy checkout path to be removed"
+  [[ -d "$canonical_dir/.git" ]] || fail "expected canonical checkout path"
+  [[ "$(git -C "$canonical_dir" remote get-url origin)" == "$canonical_url" ]] \
+    || fail "expected canonical agent-cli-farm origin"
 }
 
 test_nvm_install_uses_xdg_config_home
@@ -225,4 +247,5 @@ test_gh_release_platform_mapping
 test_install_gh_auto_installs_without_sudo
 test_coding_agent_install_sources_bashrc_and_uses_npm_global
 test_main_uses_no_sudo_bash_git_simplified_install_method
+test_legacy_agent_farm_checkout_is_migrated
 printf 'ok - recommended_workflow_setup regression checks\n'

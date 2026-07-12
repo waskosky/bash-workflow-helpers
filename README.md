@@ -137,6 +137,7 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 - If `gh` isn’t logged in, scripts will prompt for web login.
 - If `gh` is missing, the recommended setup installs it before using it. It tries Homebrew when available, then falls back to the latest official Linux, macOS, or Windows release in `~/.local/bin`, without `sudo`. Set `GH_CLI_VERSION` to pin a release or `GH_INSTALL_DIR` to change the user-local destination.
 - At the end of the recommended setup, the script sources `~/.bashrc` in its own process and globally installs `@anthropic-ai/claude-code` and `@openai/codex` with npm so the `claude` and `codex` commands are ready in future shells.
+- The recommended setup installs `agent-cli-farm` under the shared repo directory. An existing `codex-cli-farm` checkout is moved to the canonical name and its `origin` is updated automatically.
 - If corporate policy blocks certain visibilities, set `VISIBILITY` accordingly.
 - Shared history changes are idempotent and wrapped in markers with backups; re‑running is safe.
 - To apply shared history immediately in your current Bash session, run: `source ~/.bashrc`.

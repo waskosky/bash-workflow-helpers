@@ -347,6 +347,26 @@ sync_repo() {
   fi
 }
 
+migrate_agent_cli_farm_checkout() {
+  local new_url="$1"
+  local legacy_dir="$2"
+  local canonical_dir="$3"
+  local origin_url
+  local origin_slug
+
+  [[ ! -e "$canonical_dir" && -d "$legacy_dir/.git" ]] || return 0
+  origin_url="$(git -C "$legacy_dir" remote get-url origin 2>/dev/null || true)"
+  origin_slug="$(repo_slug_from_url "$origin_url")"
+  case "$origin_slug" in
+    waskosky/codex-cli-farm|waskosky/agent-cli-farm) ;;
+    *) die "$legacy_dir points to $origin_url; refusing automatic rename." ;;
+  esac
+
+  log "Renaming legacy checkout $legacy_dir to $canonical_dir"
+  mv "$legacy_dir" "$canonical_dir"
+  git -C "$canonical_dir" remote set-url origin "$new_url"
+}
+
 run_repo_script() {
   local repo_dir="$1"
   local script_name="$2"
@@ -371,6 +391,9 @@ main() {
   local repos_dir
   local helpers_repo_url="https://github.com/waskosky/bash-workflow-helpers"
   local helpers_repo_dir
+  local agent_farm_repo_url="https://github.com/waskosky/agent-cli-farm"
+  local agent_farm_repo_dir
+  local legacy_farm_repo_dir
   local current_origin
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -381,8 +404,12 @@ main() {
   ensure_gh_personal_login
   ensure_nvm_and_node
 
-  sync_repo "https://github.com/waskosky/codex-cli-farm" "$repos_dir/codex-cli-farm"
-  run_repo_script "$repos_dir/codex-cli-farm" "setup.sh"
+  agent_farm_repo_dir="$repos_dir/agent-cli-farm"
+  legacy_farm_repo_dir="$repos_dir/codex-cli-farm"
+  migrate_agent_cli_farm_checkout \
+    "$agent_farm_repo_url" "$legacy_farm_repo_dir" "$agent_farm_repo_dir"
+  sync_repo "$agent_farm_repo_url" "$agent_farm_repo_dir"
+  run_repo_script "$agent_farm_repo_dir" "setup.sh"
 
   helpers_repo_dir="$repos_dir/bash-workflow-helpers"
   if [[ -d "$script_dir/.git" ]]; then
