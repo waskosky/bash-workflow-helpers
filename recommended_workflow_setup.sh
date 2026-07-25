@@ -248,9 +248,14 @@ resolve_nvm_dir() {
 
 ensure_nvm_and_node() {
   local nvm_dir
+  local node_major_version="${NODE_MAJOR_VERSION:-24}"
+  local latest_node_version
   nvm_dir="$(resolve_nvm_dir)"
   local nvm_script="$nvm_dir/nvm.sh"
   export NVM_DIR="$nvm_dir"
+
+  [[ "$node_major_version" =~ ^[1-9][0-9]*$ ]] \
+    || die "NODE_MAJOR_VERSION must be a positive integer; got '$node_major_version'."
 
   if [[ ! -s "$nvm_script" ]]; then
     log "Installing nvm v0.40.3 to $nvm_dir."
@@ -264,15 +269,24 @@ ensure_nvm_and_node() {
   . "$nvm_script"
   command -v nvm >/dev/null 2>&1 || die "nvm was not available after sourcing $nvm_script."
 
-  log "Installing Node.js 24 via nvm."
-  nvm install 24
+  if ! latest_node_version="$(nvm version-remote "$node_major_version")"; then
+    die "Could not resolve the latest Node.js $node_major_version.x release with nvm."
+  fi
+  [[ "$latest_node_version" =~ ^v${node_major_version}\.[0-9]+\.[0-9]+$ ]] \
+    || die "Could not resolve the latest Node.js $node_major_version.x release with nvm."
+
+  log "Installing Node.js $latest_node_version (latest in major $node_major_version) via nvm."
+  nvm install "$latest_node_version"
+  nvm alias default "$latest_node_version"
 
   local node_version
   local npm_version
   node_version="$(node -v)"
   npm_version="$(npm -v)"
-  [[ "$node_version" == v24.* ]] || die "Expected Node.js 24.x after nvm install, got $node_version."
-  [[ -n "$npm_version" ]] || die "npm was not available after installing Node.js 24."
+  [[ "$node_version" == "$latest_node_version" ]] \
+    || die "Expected Node.js $latest_node_version after nvm install, got $node_version."
+  [[ -n "$npm_version" ]] \
+    || die "npm was not available after installing Node.js $latest_node_version."
   log "node -v => $node_version"
   log "npm -v => $npm_version"
 }

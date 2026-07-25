@@ -55,7 +55,61 @@ test_install_codex_config_backs_up_existing_config() {
     || fail "install_codex_config.sh must back up an existing config.toml"
 }
 
+test_claude_settings_template_matches_expected_content() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  cat >"$tmp_dir/expected-claude-settings.json" <<'EOF'
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "ask": []
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
+}
+EOF
+
+  cmp -s "$tmp_dir/expected-claude-settings.json" "$ROOT_DIR/claude-settings.json" \
+    || fail "claude-settings.json must match the expected Claude settings template"
+}
+
+test_install_claude_settings_writes_expected_settings() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  HOME="$tmp_dir/home" bash "$ROOT_DIR/scripts/install_claude_settings.sh" >/dev/null
+
+  [[ -f "$tmp_dir/home/.claude/settings.json" ]] \
+    || fail "install_claude_settings.sh must create ~/.claude/settings.json"
+  cmp -s "$ROOT_DIR/claude-settings.json" "$tmp_dir/home/.claude/settings.json" \
+    || fail "install_claude_settings.sh must install the expected settings.json"
+}
+
+test_install_claude_settings_backs_up_existing_settings() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$tmp_dir/home/.claude"
+  printf '{"custom":true}\n' >"$tmp_dir/home/.claude/settings.json"
+
+  HOME="$tmp_dir/home" bash "$ROOT_DIR/scripts/install_claude_settings.sh" >/dev/null
+
+  compgen -G "$tmp_dir/home/.claude/settings.json.bak.*" >/dev/null \
+    || fail "install_claude_settings.sh must back up an existing settings.json"
+}
+
 test_migration_scripts_avoid_known_bad_patterns
 test_tar_stream_copy_has_no_stdin_overriding_heredocs
 test_install_codex_config_backs_up_existing_config
+test_claude_settings_template_matches_expected_content
+test_install_claude_settings_writes_expected_settings
+test_install_claude_settings_backs_up_existing_settings
 printf 'ok - static regression checks\n'

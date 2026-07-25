@@ -12,6 +12,7 @@ These scripts are idempotent, make backups before editing your shell rc files, a
 ## Contents
 
 - `scripts/enable-shared-history.sh`: Enable live, shared history for Bash and Zsh so every terminal sees the latest commands.
+- `scripts/install_claude_settings.sh`: Install the Claude settings template to `~/.claude/settings.json`.
 - `scripts/mkprivrepo_fast.sh`: Create or connect to a GitHub repo quickly, handle auth, push, and register in GitHub Desktop.
 - `setup_newrepo.sh`: One‑time setup to install the `newrepo` convenience command and ensure `gh` is ready.
 
@@ -109,6 +110,16 @@ Environment knobs:
 - `ROOT_OVERRIDE`: directory to place the local clone (default: current working dir).
 - `PUSH_TIMEOUT`, `HTTP_TIMEOUT`: tune network timeouts (e.g., `45s`, `20s`).
 
+### install_claude_settings.sh
+
+Installs the Claude settings template to `~/.claude/settings.json`:
+
+```
+./scripts/install_claude_settings.sh
+```
+
+If `settings.json` already exists and differs from the template, the script creates a timestamped backup before replacing it. Pass `--force` to replace it without creating a backup.
+
 ### setup_newrepo.sh
 
 One‑time helper that:
@@ -136,6 +147,7 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 
 - If `gh` isn’t logged in, scripts will prompt for web login.
 - If `gh` is missing, the recommended setup installs it before using it. It tries Homebrew when available, then falls back to the latest official Linux, macOS, or Windows release in `~/.local/bin`, without `sudo`. Set `GH_CLI_VERSION` to pin a release or `GH_INSTALL_DIR` to change the user-local destination.
+- The recommended setup resolves and installs the newest available Node.js release within major version `24`, then makes that exact release the nvm default. Set `NODE_MAJOR_VERSION` to another positive integer, such as `22`, to track the newest release in that major instead.
 - At the end of the recommended setup, the script sources `~/.bashrc` in its own process and globally installs `@anthropic-ai/claude-code` and `@openai/codex` with npm so the `claude` and `codex` commands are ready in future shells.
 - The recommended setup installs `agent-cli-farm` under the shared repo directory. An existing `codex-cli-farm` checkout is moved to the canonical name and its `origin` is updated automatically.
 - If corporate policy blocks certain visibilities, set `VISIBILITY` accordingly.

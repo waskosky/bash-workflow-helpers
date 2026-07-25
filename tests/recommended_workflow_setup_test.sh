@@ -29,10 +29,24 @@ fi
 mkdir -p "$install_dir"
 cat >"$install_dir/nvm.sh" <<'NVM'
 nvm() {
-  if [[ "$1" != "install" || "$2" != "24" ]]; then
-    printf 'unexpected nvm args: %s\n' "$*" >&2
-    return 1
-  fi
+  case "$1" in
+    version-remote)
+      [[ "$2" == "24" ]] || return 1
+      printf 'v24.0.0\n'
+      return 0
+      ;;
+    install)
+      [[ "$2" == "v24.0.0" ]] || return 1
+      ;;
+    alias)
+      [[ "$2" == "default" && "$3" == "v24.0.0" ]] || return 1
+      return 0
+      ;;
+    *)
+      printf 'unexpected nvm args: %s\n' "$*" >&2
+      return 1
+      ;;
+  esac
 
   mkdir -p "$HOME/fake-node-bin"
   cat >"$HOME/fake-node-bin/node" <<'NODE'
@@ -90,6 +104,131 @@ test_nvm_install_uses_xdg_config_home() {
   )
 }
 
+test_nvm_install_resolves_latest_release_for_configured_major() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$tmp_dir/home/nvm"
+  cat >"$tmp_dir/home/nvm/nvm.sh" <<'NVM'
+nvm() {
+  printf '%s\n' "$*" >>"$NVM_CALL_RECORD"
+
+  case "$1" in
+    version-remote)
+      [[ "$2" == "22" ]] || return 1
+      printf 'v22.14.1\n'
+      ;;
+    install)
+      [[ "$2" == "v22.14.1" ]] || return 1
+      mkdir -p "$HOME/fake-node-bin"
+      cat >"$HOME/fake-node-bin/node" <<'NODE'
+#!/usr/bin/env bash
+printf 'v22.14.1\n'
+NODE
+      cat >"$HOME/fake-node-bin/npm" <<'NPM'
+#!/usr/bin/env bash
+printf '10.9.2\n'
+NPM
+      chmod +x "$HOME/fake-node-bin/node" "$HOME/fake-node-bin/npm"
+      export PATH="$HOME/fake-node-bin:$PATH"
+      ;;
+    alias)
+      [[ "$2" == "default" && "$3" == "v22.14.1" ]] || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+NVM
+
+  (
+    export HOME="$tmp_dir/home"
+    export NVM_DIR="$HOME/nvm"
+    export NODE_MAJOR_VERSION=22
+    export NVM_CALL_RECORD="$tmp_dir/nvm-calls"
+
+    load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+    ensure_nvm_and_node >/dev/null
+  )
+
+  [[ "$(cat "$tmp_dir/nvm-calls")" == $'version-remote 22\ninstall v22.14.1\nalias default v22.14.1' ]] \
+    || fail "expected nvm to resolve, install, and default to the latest release in major 22"
+}
+
+test_nvm_install_rejects_invalid_node_major() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$tmp_dir/home/nvm"
+  cat >"$tmp_dir/home/nvm/nvm.sh" <<'NVM'
+nvm() {
+  printf '%s\n' "$*" >>"$NVM_CALL_RECORD"
+  printf 'N/A\n'
+}
+NVM
+
+  (
+    local output
+    local status
+    export HOME="$tmp_dir/home"
+    export NVM_DIR="$HOME/nvm"
+    export NODE_MAJOR_VERSION="22.x"
+    export NVM_CALL_RECORD="$tmp_dir/nvm-calls"
+
+    load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+    set +e
+    output="$(ensure_nvm_and_node 2>&1)"
+    status=$?
+    set -e
+
+    [[ "$status" -ne 0 ]] || fail "expected an invalid Node.js major to fail"
+    [[ "$output" == *"NODE_MAJOR_VERSION must be a positive integer; got '22.x'."* ]] \
+      || fail "expected a clear invalid Node.js major error"
+    [[ ! -e "$NVM_CALL_RECORD" ]] \
+      || fail "expected an invalid Node.js major to be rejected before invoking nvm"
+  )
+}
+
+test_nvm_install_rejects_unresolved_remote_version() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  mkdir -p "$tmp_dir/home/nvm"
+  cat >"$tmp_dir/home/nvm/nvm.sh" <<'NVM'
+nvm() {
+  printf '%s\n' "$*" >>"$NVM_CALL_RECORD"
+  if [[ "$1" == "version-remote" && "$2" == "22" ]]; then
+    printf 'N/A\n'
+  fi
+}
+NVM
+
+  (
+    local output
+    local status
+    export HOME="$tmp_dir/home"
+    export NVM_DIR="$HOME/nvm"
+    export NODE_MAJOR_VERSION=22
+    export NVM_CALL_RECORD="$tmp_dir/nvm-calls"
+
+    load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+    set +e
+    output="$(ensure_nvm_and_node 2>&1)"
+    status=$?
+    set -e
+
+    [[ "$status" -ne 0 ]] || fail "expected an unresolved remote Node.js version to fail"
+    [[ "$output" == *"Could not resolve the latest Node.js 22.x release with nvm."* ]] \
+      || fail "expected a clear unresolved Node.js version error"
+    [[ "$(cat "$NVM_CALL_RECORD")" == "version-remote 22" ]] \
+      || fail "expected an unresolved version to fail before nvm install"
+  )
+}
+
 test_gh_release_platform_mapping() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -142,6 +281,7 @@ test_coding_agent_install_sources_bashrc_and_uses_npm_global() {
 
   mkdir -p "$tmp_dir/bin" "$tmp_dir/home"
   printf 'export BASHRC_SOURCED_FOR_TEST=yes\n' >"$tmp_dir/home/.bashrc"
+  # shellcheck disable=SC2016
   make_executable "$tmp_dir/bin/npm" '#!/usr/bin/env bash
 printf "%s|%s\n" "${BASHRC_SOURCED_FOR_TEST:-no}" "$*" >"$NPM_INSTALL_RECORD"'
 
@@ -243,6 +383,9 @@ test_legacy_agent_farm_checkout_is_migrated() {
 }
 
 test_nvm_install_uses_xdg_config_home
+test_nvm_install_resolves_latest_release_for_configured_major
+test_nvm_install_rejects_invalid_node_major
+test_nvm_install_rejects_unresolved_remote_version
 test_gh_release_platform_mapping
 test_install_gh_auto_installs_without_sudo
 test_coding_agent_install_sources_bashrc_and_uses_npm_global
