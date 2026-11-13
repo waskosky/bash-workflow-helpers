@@ -222,12 +222,16 @@ ensure_gh_personal_login() {
   else
     cat <<'EOF'
 [setup] GitHub login is required for personal account usage.
-[setup] In the prompts, select:
-[setup]   1) GitHub.com
-[setup]   2) HTTPS
-[setup]   3) Login with a web browser
+[setup] GitHub.com, HTTPS, and web login are selected automatically.
+[setup] If asked to authenticate Git with your GitHub credentials, choose Yes.
+[setup] Copy the one-time code and press Enter when prompted.
+[setup] Open https://github.com/login/device in your browser and enter the code.
+[setup] Firefox/GTK settings warnings alone do not mean GitHub login failed.
+[setup] If browser launch hangs, press Ctrl+C and rerun this setup with GH_BROWSER=true.
+[setup] With GH_BROWSER=true, still press Enter when prompted, then open the URL yourself.
 EOF
-    gh auth login --hostname github.com --git-protocol https --web
+    gh auth login --hostname github.com --git-protocol https --web \
+      || die "GitHub login failed. If browser launch failed, rerun this setup with GH_BROWSER=true and open the device URL manually."
     gh auth status --hostname github.com >/dev/null 2>&1 || die "GitHub authentication did not complete."
     log "GitHub CLI authentication completed."
   fi

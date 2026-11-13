@@ -146,6 +146,13 @@ Afterwards, run `newrepo "Title" owner/repo` from any directory.
 ## Notes & troubleshooting
 
 - If `gh` isn’t logged in, scripts will prompt for web login.
+- During recommended setup, GitHub.com, HTTPS, and web login are already selected. Choose **Yes** if asked to authenticate Git, copy the one-time code, and press Enter when prompted.
+- A Firefox warning such as `Failed to parse /etc/xdg/xdg-Lubuntu/gtk-3.0/settings.ini: Permission denied` concerns desktop settings; it does not by itself mean GitHub authentication failed. If the browser opened, finish the login there. Otherwise, open <https://github.com/login/device> yourself and enter the code while setup is still running.
+- If the browser launch hangs, press Ctrl+C and restart setup with automatic browser launching disabled:
+  ```bash
+  GH_BROWSER=true ./recommended_workflow_setup.sh
+  ```
+  Still press Enter at the browser prompt, then open <https://github.com/login/device> manually and enter the **new** code. Keep the terminal running until authentication completes and setup continues. This uses GitHub CLI's [`GH_BROWSER` setting](https://cli.github.com/manual/gh_help_environment) to run the no-op `true` command instead of launching a browser.
 - If `gh` is missing, the recommended setup installs it before using it. It tries Homebrew when available, then falls back to the latest official Linux, macOS, or Windows release in `~/.local/bin`, without `sudo`. Set `GH_CLI_VERSION` to pin a release or `GH_INSTALL_DIR` to change the user-local destination.
 - The recommended setup resolves and installs the newest available Node.js release within major version `24`, then makes that exact release the nvm default. Set `NODE_MAJOR_VERSION` to another positive integer, such as `22`, to track the newest release in that major instead.
 - At the end of the recommended setup, the script sources `~/.bashrc` in its own process and globally installs `@anthropic-ai/claude-code` and `@openai/codex` with npm so the `claude` and `codex` commands are ready in future shells.
