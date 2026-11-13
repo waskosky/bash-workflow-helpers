@@ -225,13 +225,13 @@ ensure_gh_personal_login() {
 [setup] GitHub.com, HTTPS, and web login are selected automatically.
 [setup] If asked to authenticate Git with your GitHub credentials, choose Yes.
 [setup] Copy the one-time code and press Enter when prompted.
-[setup] Open https://github.com/login/device in your browser and enter the code.
-[setup] Firefox/GTK settings warnings alone do not mean GitHub login failed.
-[setup] If browser launch hangs, press Ctrl+C and rerun this setup with GH_BROWSER=true.
-[setup] With GH_BROWSER=true, still press Enter when prompted, then open the URL yourself.
+[setup] Automatic browser launch is disabled by default, even at the browser prompt.
+[setup] Open https://github.com/login/device yourself and enter the code.
+[setup] Keep this terminal open until authentication completes.
 EOF
-    gh auth login --hostname github.com --git-protocol https --web \
-      || die "GitHub login failed. If browser launch failed, rerun this setup with GH_BROWSER=true and open the device URL manually."
+    # Use manual device login unless the user explicitly selects a browser.
+    GH_BROWSER="${GH_BROWSER:-true}" gh auth login --hostname github.com --git-protocol https --web \
+      || die "GitHub login failed or was cancelled. Rerun setup and complete device login with the new code."
     gh auth status --hostname github.com >/dev/null 2>&1 || die "GitHub authentication did not complete."
     log "GitHub CLI authentication completed."
   fi

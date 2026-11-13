@@ -274,6 +274,65 @@ exit 89"
   )
 }
 
+test_gh_login_browser_launch_is_opt_in() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  # shellcheck disable=SC2016
+  make_executable "$tmp_dir/browser" '#!/usr/bin/env bash
+printf "%s\n" "$*" >>"$GH_TEST_BROWSER_LOG"'
+
+  (
+    load_setup_functions "$tmp_dir/recommended_workflow_setup.lib.sh"
+    export BROWSER="$tmp_dir/browser"
+    local mode authenticated git_configured
+
+    gh() {
+      case "$*" in
+        "auth status --hostname github.com") [[ "$authenticated" -eq 1 ]] ;;
+        "auth login --hostname github.com --git-protocol https --web")
+          "${GH_BROWSER:-$BROWSER}" https://github.com/login/device || return 1
+          authenticated=1
+          ;;
+        "auth setup-git") git_configured=1 ;;
+        *) fail "unexpected gh arguments: $*" ;;
+      esac
+    }
+
+    for mode in unset empty explicit; do
+      authenticated=0
+      git_configured=0
+      export GH_TEST_BROWSER_LOG="$tmp_dir/browser-$mode.log"
+      unset GH_BROWSER
+      case "$mode" in
+        empty) export GH_BROWSER="" ;;
+        explicit) export GH_BROWSER="$tmp_dir/browser" ;;
+      esac
+
+      ensure_gh_personal_login >"$tmp_dir/login-$mode.out"
+
+      [[ "$authenticated" -eq 1 && "$git_configured" -eq 1 ]] \
+        || fail "expected $mode browser mode to complete login and configure Git"
+      if [[ "$mode" == explicit ]]; then
+        [[ -f "$GH_TEST_BROWSER_LOG" ]] || fail "expected explicit GH_BROWSER to launch"
+        [[ "$(cat "$GH_TEST_BROWSER_LOG")" == "https://github.com/login/device" ]] \
+          || fail "expected explicit browser to receive the device login URL"
+        [[ "$GH_BROWSER" == "$BROWSER" ]] || fail "explicit GH_BROWSER must be preserved"
+      else
+        [[ ! -e "$GH_TEST_BROWSER_LOG" ]] \
+          || fail "setup must not launch the default browser when GH_BROWSER is $mode"
+        if [[ "$mode" == unset ]]; then
+          [[ "${GH_BROWSER+x}" != x ]] || fail "login must not leave GH_BROWSER set"
+        else
+          [[ "${GH_BROWSER+x}" == x && -z "$GH_BROWSER" ]] \
+            || fail "login must preserve an empty GH_BROWSER"
+        fi
+      fi
+    done
+  )
+}
+
 test_coding_agent_install_sources_bashrc_and_uses_npm_global() {
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -388,6 +447,7 @@ test_nvm_install_rejects_invalid_node_major
 test_nvm_install_rejects_unresolved_remote_version
 test_gh_release_platform_mapping
 test_install_gh_auto_installs_without_sudo
+test_gh_login_browser_launch_is_opt_in
 test_coding_agent_install_sources_bashrc_and_uses_npm_global
 test_main_uses_no_sudo_bash_git_simplified_install_method
 test_legacy_agent_farm_checkout_is_migrated
